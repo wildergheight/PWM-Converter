@@ -14,11 +14,13 @@
  * 2. Failsafe: If an input signal is lost for more than a defined timeout 
  * (FAILSAFE_TIMEOUT_US), the code reverts that channel's output to a neutral/default
  * pulse width (DEFAULT_PULSE_US).
- * 3. State Machine: The main loop runs a simple, non-blocking state machine that
+ * 3. Deadzone: A configurable deadzone around the neutral pulse width prevents motor
+ * jitter when the RC transmitter stick is untouched.
+ * 4. State Machine: The main loop runs a simple, non-blocking state machine that
  * generates the new pulses manually. It fires the first pulse, waits for it to finish,
  * fires the second pulse, and then waits for the next cycle. This guarantees the
  * pulses are sequential and never overlap.
- * 4. IRAM_ATTR: The Interrupt Service Routines (ISRs) are placed in IRAM (Instruction RAM)
+ * 5. IRAM_ATTR: The Interrupt Service Routines (ISRs) are placed in IRAM (Instruction RAM)
  * for faster execution, which is a best practice on the ESP32.
  *
  * Wiring:
@@ -56,6 +58,12 @@ const unsigned int DEFAULT_PULSE_US = 1500;
 // Maximum time in microseconds without a new pulse before failsafe is triggered.
 // 100,000 us = 100 ms.
 const unsigned long FAILSAFE_TIMEOUT_US = 100000;
+
+// --- Deadzone Configuration ---
+// The +/- range around the neutral pulse to ignore for preventing jitter.
+// If the input is within `DEFAULT_PULSE_US ± PULSE_DEADZONE_US`, it will be
+// clamped to the default neutral value. Increase if you still see jitter.
+const int PULSE_DEADZONE_US = 25;
 
 
 //================================================================================
@@ -161,6 +169,16 @@ void loop() {
     pulse2_width = DEFAULT_PULSE_US;
   }
   
+  // --- Deadzone Application ---
+  // If the input pulse is within the deadzone around neutral, clamp it to neutral.
+  // This prevents motor jitter from small RC receiver signal fluctuations.
+  if (abs(pulse1_width - DEFAULT_PULSE_US) <= PULSE_DEADZONE_US) {
+    pulse1_width = DEFAULT_PULSE_US;
+  }
+  if (abs(pulse2_width - DEFAULT_PULSE_US) <= PULSE_DEADZONE_US) {
+    pulse2_width = DEFAULT_PULSE_US;
+  }
+
   // --- Non-Blocking State Machine for Pulse Generation ---
   switch (g_current_state) {
     
