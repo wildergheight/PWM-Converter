@@ -1,229 +1,193 @@
 /*
- * ESP32 Dual PWM to Time-Spaced PWM Converter for ODrive
+ * ESP32 PWM to ODrive Serial (ASCII) Converter
  * * Author: Gemini
- * Date: June 13, 2025
+ * Date: June 17, 2025
  * * Description:
- * This code reads two standard, potentially overlapping PWM signals (like those from an
- * RC receiver) and converts them into two non-overlapping, time-spaced PWM signals.
- * This is useful for motor controllers like the ODrive, which require a gap between
- * the falling edge of one pulse and the rising edge of the next.
+ * This code reads two standard PWM signals from an RC receiver and converts them
+ * into serial ASCII commands to control the velocity of two axes on an ODrive.
+ * This provides more precise and robust control than PWM output and is ideal
+ * for future automation.
  * * How it works:
- * 1. Interrupts: It uses pin change interrupts (`CHANGE`) on two input pins to 
- * asynchronously measure the pulse width of the incoming signals. This is non-blocking
- * and accurate. The results are stored in volatile variables.
- * 2. Failsafe: If an input signal is lost for more than a defined timeout 
- * (FAILSAFE_TIMEOUT_US), the code reverts that channel's output to a neutral/default
- * pulse width (DEFAULT_PULSE_US).
- * 3. Deadzone: A configurable deadzone around the neutral pulse width prevents motor
- * jitter when the RC transmitter stick is untouched.
- * 4. State Machine: The main loop runs a simple, non-blocking state machine that
- * generates the new pulses manually. It fires the first pulse, waits for it to finish,
- * fires the second pulse, and then waits for the next cycle. This guarantees the
- * pulses are sequential and never overlap.
- * 5. IRAM_ATTR: The Interrupt Service Routines (ISRs) are placed in IRAM (Instruction RAM)
- * for faster execution, which is a best practice on the ESP32.
+ * 1.  PWM Input: Uses pin change interrupts to measure the incoming RC pulse widths
+ * asynchronously, just like the previous version.
+ * 2.  Failsafe & Deadzone: Includes failsafe to handle signal loss and a deadzone
+ * around the neutral signal to prevent motor jitter.
+ * 3.  Velocity Mapping: In the main loop, the measured pulse width (1000-2000µs)
+ * is mapped to a velocity range (e.g., -20 to +20 turns/sec).
+ * 4.  Serial Command Output: The ESP32 uses a second hardware serial port to send
+ * ODrive ASCII protocol commands (e.g., "v 0 15.5\n") at a fixed rate. This
+ * avoids flooding the ODrive with commands while maintaining responsive control.
  *
  * Wiring:
- * - Connect your first PWM signal source to GPIO 16 (PWM_INPUT_1).
- * - Connect your second PWM signal source to GPIO 17 (PWM_INPUT_2).
- * - Connect ODrive's first PWM input to GPIO 18 (PWM_OUTPUT_1).
- * - Connect ODrive's second PWM input to GPIO 19 (PWM_OUTPUT_2).
- * - Ensure a common ground (GND) between the ESP32 and your signal sources.
- * * You can easily change these pins in the "Pin Definitions" section below.
+ * - RC Receiver:
+ * - Connect your first PWM signal source to GPIO 13.
+ * - Connect your second PWM signal source to GPIO 12.
+ * - Ensure a common ground (GND) between the ESP32 and the receiver.
+ * - ODrive:
+ * - Connect ESP32 GPIO 17 (TX2) to the ODrive's RX pin.
+ * - Connect ESP32 GPIO 16 (RX2) to the ODrive's TX pin.
+ * - Ensure a common ground (GND) between the ESP32 and the ODrive.
+ * - USB (for Debugging):
+ * - Connect the ESP32 to your computer via USB to view debug messages.
+ *
+ * ** IMPORTANT ODRIVE CONFIGURATION **
+ * You must configure the ODrive's GPIO pins for UART communication. For example:
+ * odrv0.config.enable_uart_a = True
+ * odrv0.config.gpio(1)_mode = GpioMode.UART_A // Use your ODrive's correct TX pin
+ * odrv0.config.gpio(2)_mode = GpioMode.UART_A // Use your ODrive's correct RX pin
+ * odrv0.save_configuration()
+ * And ensure the baud rate matches `ODRIVE_BAUD_RATE` below.
  */
 
-// Include the main Arduino library header. This is essential for .cpp files.
+// Include the main Arduino library header.
 #include <Arduino.h>
 
 //================================================================================
 // Configuration
 //================================================================================
 
-// --- Pin Definitions ---
-const int PWM_INPUT_1 = 16;  // RX2 on many ESP32 boards
-const int PWM_INPUT_2 = 17;  // TX2 on many ESP32 boards
+// --- PWM Input Pin Definitions ---
+const int PWM_INPUT_1 = 13; // For Axis 0
+const int PWM_INPUT_2 = 12; // For Axis 1
 
-const int PWM_OUTPUT_1 = 18; // Any free GPIO
-const int PWM_OUTPUT_2 = 19; // Any free GPIO
+// --- ODrive Serial Port Configuration ---
+// Using Serial2 for ODrive communication. Serial (UART0) is for USB debugging.
+#define ODRIVE_SERIAL Serial2
+const int ODRIVE_RX_PIN = 16; // GPIO 16 (ESP32 RX2) -> ODrive TX
+const int ODRIVE_TX_PIN = 17; // GPIO 17 (ESP32 TX2) -> ODrive RX
+const long ODRIVE_BAUD_RATE = 115200;
 
-// --- Timing and Failsafe Configuration ---
-// The period for the entire output cycle (Pulse1 + Pulse2 + Idle time) in microseconds.
-// 20000 us = 20 ms = 50 Hz, a standard servo frequency.
-const unsigned long CYCLE_PERIOD_US = 20000; 
+// --- Control & Timing Configuration ---
+const unsigned int DEFAULT_PULSE_US = 1500; // Neutral RC signal
+const unsigned int MIN_PULSE_US = 1000;     // Full reverse RC signal
+const unsigned int MAX_PULSE_US = 2000;     // Full forward RC signal
+const int PULSE_DEADZONE_US = 25;           // Jitter prevention range (+/-)
 
-// Default pulse width in microseconds if the signal is lost (failsafe).
-// 1500 us is the standard neutral position for RC signals.
-const unsigned int DEFAULT_PULSE_US = 1500;
+const float MAX_VELOCITY = 20.0; // Max velocity in [turns/sec] at full stick
 
-// Maximum time in microseconds without a new pulse before failsafe is triggered.
-// 100,000 us = 100 ms.
-const unsigned long FAILSAFE_TIMEOUT_US = 100000;
-
-// --- Deadzone Configuration ---
-// The +/- range around the neutral pulse to ignore for preventing jitter.
-// If the input is within `DEFAULT_PULSE_US ± PULSE_DEADZONE_US`, it will be
-// clamped to the default neutral value. Increase if you still see jitter.
-const int PULSE_DEADZONE_US = 25;
-
+// How often to send commands to ODrive (in milliseconds). 20ms = 50 Hz.
+const unsigned long COMMAND_INTERVAL_MS = 20;
+const unsigned long FAILSAFE_TIMEOUT_US = 100000; // 100 ms
 
 //================================================================================
 // Global Variables
 //================================================================================
 
-// --- Volatile variables for Interrupt-Main Loop Communication ---
-// These are modified by ISRs, so they must be declared 'volatile'.
+// For PWM input interrupts
 volatile unsigned long g_pulse1_start_time = 0;
 volatile unsigned long g_pulse2_start_time = 0;
-
 volatile unsigned int g_pulse1_width_us = DEFAULT_PULSE_US;
 volatile unsigned int g_pulse2_width_us = DEFAULT_PULSE_US;
-
 volatile unsigned long g_last_pulse1_update_time = 0;
 volatile unsigned long g_last_pulse2_update_time = 0;
 
-
-// --- State machine variables ---
-enum State {
-  STATE_IDLE,
-  STATE_PULSE_1_ON,
-  STATE_PULSE_2_ON
-};
-
-State g_current_state = STATE_IDLE;
-unsigned long g_cycle_start_time = 0;
-unsigned long g_pulse_start_time = 0;
-
+// For timing the serial commands
+unsigned long g_last_command_time = 0;
 
 //================================================================================
-// Interrupt Service Routines (ISRs)
+// Interrupt Service Routines (ISRs) for PWM Input
 //================================================================================
 
-// ISR for the first PWM input. `IRAM_ATTR` ensures it runs from fast RAM.
 void IRAM_ATTR isr_pwm1() {
   if (digitalRead(PWM_INPUT_1) == HIGH) {
-    // Rising edge: record the start time.
     g_pulse1_start_time = micros();
   } else {
-    // Falling edge: calculate pulse width and record the update time.
     g_pulse1_width_us = micros() - g_pulse1_start_time;
     g_last_pulse1_update_time = micros();
   }
 }
 
-// ISR for the second PWM input.
 void IRAM_ATTR isr_pwm2() {
   if (digitalRead(PWM_INPUT_2) == HIGH) {
-    // Rising edge: record the start time.
     g_pulse2_start_time = micros();
   } else {
-    // Falling edge: calculate pulse width and record the update time.
     g_pulse2_width_us = micros() - g_pulse2_start_time;
     g_last_pulse2_update_time = micros();
   }
 }
 
+//================================================================================
+// Helper Function
+//================================================================================
+
+// Maps an input value from a source range to a target range (float version)
+float map_float(float x, float in_min, float in_max, float out_min, float out_max) {
+  return (x - in_min) * (out_max - out_min) / (in_max - in_min) + out_min;
+}
 
 //================================================================================
 // Main Program: setup() and loop()
 //================================================================================
 
 void setup() {
-  // Start serial communication for debugging
+  // Start serial for debugging
   Serial.begin(115200);
-  Serial.println("Starting PWM Time-Spacing Converter...");
+  Serial.println("Starting PWM to ODrive Serial Converter...");
 
-  // Configure pin modes
+  // Start serial for ODrive communication
+  ODRIVE_SERIAL.begin(ODRIVE_BAUD_RATE, SERIAL_8N1, ODRIVE_RX_PIN, ODRIVE_TX_PIN);
+  Serial.println("ODrive serial port initialized.");
+
+  // Configure PWM input pins
   pinMode(PWM_INPUT_1, INPUT_PULLUP);
   pinMode(PWM_INPUT_2, INPUT_PULLUP);
-  pinMode(PWM_OUTPUT_1, OUTPUT);
-  pinMode(PWM_OUTPUT_2, OUTPUT);
 
-  // Ensure outputs start in a LOW state
-  digitalWrite(PWM_OUTPUT_1, LOW);
-  digitalWrite(PWM_OUTPUT_2, LOW);
-
-  // Attach interrupts to the input pins. They will trigger on any voltage change (RISING or FALLING).
+  // Attach interrupts
   attachInterrupt(digitalPinToInterrupt(PWM_INPUT_1), isr_pwm1, CHANGE);
   attachInterrupt(digitalPinToInterrupt(PWM_INPUT_2), isr_pwm2, CHANGE);
   
-  // Initialize cycle start time
-  g_cycle_start_time = micros();
+  Serial.println("Ready for RC input.");
 }
 
 void loop() {
-  // Atomically copy volatile variables to local scope to prevent race conditions.
-  unsigned long current_time = micros();
-  noInterrupts(); // Disable interrupts briefly to safely copy multi-byte variables
-  unsigned int pulse1_width = g_pulse1_width_us;
-  unsigned int pulse2_width = g_pulse2_width_us;
-  unsigned long last_pulse1_time = g_last_pulse1_update_time;
-  unsigned long last_pulse2_time = g_last_pulse2_update_time;
-  interrupts(); // Re-enable interrupts immediately
+  unsigned long current_millis = millis();
 
-  // --- Failsafe Check ---
-  // If we haven't received a pulse in a while, revert to the default neutral value.
-  if (current_time - last_pulse1_time > FAILSAFE_TIMEOUT_US) {
-    pulse1_width = DEFAULT_PULSE_US;
-  }
-  if (current_time - last_pulse2_time > FAILSAFE_TIMEOUT_US) {
-    pulse2_width = DEFAULT_PULSE_US;
-  }
-  
-  // --- Deadzone Application ---
-  // If the input pulse is within the deadzone around neutral, clamp it to neutral.
-  // This prevents motor jitter from small RC receiver signal fluctuations.
-  if (abs((int)pulse1_width - (int)DEFAULT_PULSE_US) <= PULSE_DEADZONE_US) {
-    pulse1_width = DEFAULT_PULSE_US;
-}
-if (abs((int)pulse2_width - (int)DEFAULT_PULSE_US) <= PULSE_DEADZONE_US) {
-    pulse2_width = DEFAULT_PULSE_US;
-}
+  // Only send commands at the specified interval
+  if (current_millis - g_last_command_time >= COMMAND_INTERVAL_MS) {
+    g_last_command_time = current_millis;
 
-  // --- Non-Blocking State Machine for Pulse Generation ---
-  switch (g_current_state) {
+    // --- Get latest pulse width data safely ---
+    unsigned long current_micros = micros();
+    noInterrupts();
+    unsigned int pulse1 = g_pulse1_width_us;
+    unsigned int pulse2 = g_pulse2_width_us;
+    unsigned long last_pulse1_time = g_last_pulse1_update_time;
+    unsigned long last_pulse2_time = g_last_pulse2_update_time;
+    interrupts();
+
+    // --- Apply Failsafe ---
+    if (current_micros - last_pulse1_time > FAILSAFE_TIMEOUT_US) {
+      pulse1 = DEFAULT_PULSE_US;
+    }
+    if (current_micros - last_pulse2_time > FAILSAFE_TIMEOUT_US) {
+      pulse2 = DEFAULT_PULSE_US;
+    }
+
+    // --- Apply Deadzone ---
+    if (abs((int)pulse1 - (int)DEFAULT_PULSE_US) <= PULSE_DEADZONE_US) {
+    pulse1 = DEFAULT_PULSE_US;
+    }
+    if (abs((int)pulse2 - (int)DEFAULT_PULSE_US) <= PULSE_DEADZONE_US) {
+        pulse2 = DEFAULT_PULSE_US;
+    }
+
+    // --- Map Pulse Width to Velocity ---
+    float velocity1 = map_float(pulse1, MIN_PULSE_US, MAX_PULSE_US, -MAX_VELOCITY, MAX_VELOCITY);
+    float velocity2 = map_float(pulse2, MIN_PULSE_US, MAX_PULSE_US, -MAX_VELOCITY, MAX_VELOCITY);
+
+    // Clamp values to the max velocity in case of over/under-shoot from RC receiver
+    velocity1 = constrain(velocity1, -MAX_VELOCITY, MAX_VELOCITY);
+    velocity2 = constrain(velocity2, -MAX_VELOCITY, MAX_VELOCITY);
     
-    case STATE_IDLE:
-      // We are waiting for the next cycle to begin.
-      if (current_time - g_cycle_start_time >= CYCLE_PERIOD_US) {
-        g_cycle_start_time = current_time; // Start a new cycle
-        g_pulse_start_time = current_time; // Record when the pulse itself starts
-        
-        // Begin the first pulse
-        digitalWrite(PWM_OUTPUT_1, HIGH);
-        g_current_state = STATE_PULSE_1_ON;
-      }
-      break;
+    // --- Format and Send Serial Commands to ODrive ---
+    String command1 = "v 0 " + String(velocity1, 2) + "\n"; // "v 0 -15.75\n"
+    String command2 = "v 1 " + String(velocity2, 2) + "\n"; // "v 1 20.00\n"
 
-    case STATE_PULSE_1_ON:
-      // The first pulse is currently HIGH. Check if it's time to turn it off.
-      if (current_time - g_pulse_start_time >= pulse1_width) {
-        digitalWrite(PWM_OUTPUT_1, LOW); // End the first pulse
-        g_pulse_start_time = current_time; // Record start time for the second pulse
-        
-        // Immediately begin the second pulse
-        digitalWrite(PWM_OUTPUT_2, HIGH);
-        g_current_state = STATE_PULSE_2_ON;
-      }
-      break;
-
-    case STATE_PULSE_2_ON:
-      // The second pulse is currently HIGH. Check if it's time to turn it off.
-      if (current_time - g_pulse_start_time >= pulse2_width) {
-        digitalWrite(PWM_OUTPUT_2, LOW); // End the second pulse
-        
-        // Return to idle state to wait for the next cycle period.
-        g_current_state = STATE_IDLE;
-      }
-      break;
+    ODRIVE_SERIAL.print(command1);
+    ODRIVE_SERIAL.print(command2);
+    
+    // --- Optional: Print debug info to USB serial ---
+    // Uncomment the line below for debugging.
+    // Serial.print("Axis0: " + String(velocity1, 2) + " | Axis1: " + String(velocity2, 2));
   }
-
-  // Optional: Print measured pulse widths to Serial Monitor for debugging.
-  // Uncomment the following lines to enable. This may affect timing slightly.
-  /*
-  static unsigned long last_print_time = 0;
-  if (millis() - last_print_time > 100) {
-    Serial.printf("Input 1: %u us, Input 2: %u us\n", pulse1_width, pulse2_width);
-    last_print_time = millis();
-  }
-  */
 }
