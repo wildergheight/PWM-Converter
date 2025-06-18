@@ -188,6 +188,6 @@ void loop() {
     
     // --- Optional: Print debug info to USB serial ---
     // Uncomment the line below for debugging.
-    // Serial.print("Axis0: " + String(velocity1, 2) + " | Axis1: " + String(velocity2, 2));
+    Serial.print("Axis0: " + String(velocity1, 2) + " | Axis1: " + String(velocity2, 2));
   }
 }
