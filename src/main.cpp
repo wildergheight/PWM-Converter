@@ -172,12 +172,12 @@ void loop() {
   // --- Deadzone Application ---
   // If the input pulse is within the deadzone around neutral, clamp it to neutral.
   // This prevents motor jitter from small RC receiver signal fluctuations.
-  if (abs(pulse1_width - DEFAULT_PULSE_US) <= PULSE_DEADZONE_US) {
+  if (abs((int)pulse1_width - (int)DEFAULT_PULSE_US) <= PULSE_DEADZONE_US) {
     pulse1_width = DEFAULT_PULSE_US;
-  }
-  if (abs(pulse2_width - DEFAULT_PULSE_US) <= PULSE_DEADZONE_US) {
+}
+if (abs((int)pulse2_width - (int)DEFAULT_PULSE_US) <= PULSE_DEADZONE_US) {
     pulse2_width = DEFAULT_PULSE_US;
-  }
+}
 
   // --- Non-Blocking State Machine for Pulse Generation ---
   switch (g_current_state) {
