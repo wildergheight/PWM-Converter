@@ -61,9 +61,9 @@ const long ODRIVE_BAUD_RATE = 115200;
 const unsigned int DEFAULT_PULSE_US = 1500; // Neutral RC signal
 const unsigned int MIN_PULSE_US = 1000;     // Full reverse RC signal
 const unsigned int MAX_PULSE_US = 2000;     // Full forward RC signal
-const int PULSE_DEADZONE_US = 25;           // Jitter prevention range (+/-)
+const int PULSE_DEADZONE_US = 40;           // Jitter prevention range (+/-)
 
-const float MAX_VELOCITY = 20.0; // Max velocity in [turns/sec] at full stick
+const float MAX_VELOCITY = 10.0; // Max velocity in [turns/sec] at full stick
 
 // How often to send commands to ODrive (in milliseconds). 20ms = 50 Hz.
 const unsigned long COMMAND_INTERVAL_MS = 20;
@@ -188,6 +188,6 @@ void loop() {
     
     // --- Optional: Print debug info to USB serial ---
     // Uncomment the line below for debugging.
-    Serial.print("Axis0: " + String(velocity1, 2) + " | Axis1: " + String(velocity2, 2));
+    Serial.println("Axis0: " + String(velocity1, 2) + " | Axis1: " + String(velocity2, 2));
   }
 }
