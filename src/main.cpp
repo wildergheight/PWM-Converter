@@ -1,19 +1,21 @@
 /*
  * ESP32 PWM to ODrive Serial (ASCII) Converter
  * * Author: Gemini
- * Date: June 17, 2025
+ * * Date: June 19, 2025
+ * * Version: 2.0 (With Sanity Check)
+ * *
  * * Description:
  * This code reads two standard PWM signals from an RC receiver and converts them
  * into serial ASCII commands to control the velocity of two axes on an ODrive.
- * This provides more precise and robust control than PWM output and is ideal
- * for future automation.
+ * *
  * * How it works:
  * 1.  PWM Input: Uses pin change interrupts to measure the incoming RC pulse widths
  * asynchronously, just like the previous version.
- * 2.  Failsafe & Deadzone: Includes failsafe to handle signal loss and a deadzone
- * around the neutral signal to prevent motor jitter.
+ * 2.  Sanity Check & Failsafe: Includes a sanity check to reject out-of-range
+ * PWM signals (preventing max-speed spikes) and a failsafe to handle total
+ * signal loss. A deadzone around neutral prevents motor jitter.
  * 3.  Velocity Mapping: In the main loop, the measured pulse width (1000-2000µs)
- * is mapped to a velocity range (e.g., -20 to +20 turns/sec).
+ * is mapped to a velocity range (e.g., -10 to +10 turns/sec).
  * 4.  Serial Command Output: The ESP32 uses a second hardware serial port to send
  * ODrive ASCII protocol commands (e.g., "v 0 15.5\n") at a fixed rate. This
  * avoids flooding the ODrive with commands while maintaining responsive control.
@@ -156,6 +158,7 @@ void loop() {
     interrupts();
 
     // --- Apply Failsafe ---
+    // If we haven't received a fresh pulse in a while, reset to neutral.
     if (current_micros - last_pulse1_time > FAILSAFE_TIMEOUT_US) {
       pulse1 = DEFAULT_PULSE_US;
     }
@@ -163,25 +166,37 @@ void loop() {
       pulse2 = DEFAULT_PULSE_US;
     }
 
+    // ★★★ NEW CODE: Sanity Check ★★★
+    // This is the most important fix for the max-speed spikes.
+    // If the pulse is outside the valid range, it's a bad reading. Reset it.
+    if (pulse1 < MIN_PULSE_US || pulse1 > MAX_PULSE_US) {
+      pulse1 = DEFAULT_PULSE_US;
+    }
+    if (pulse2 < MIN_PULSE_US || pulse2 > MAX_PULSE_US) {
+      pulse2 = DEFAULT_PULSE_US;
+    }
+
     // --- Apply Deadzone ---
+    // After validation, check if the pulse is in the neutral jitter zone.
     if (abs((int)pulse1 - (int)DEFAULT_PULSE_US) <= PULSE_DEADZONE_US) {
-    pulse1 = DEFAULT_PULSE_US;
+      pulse1 = DEFAULT_PULSE_US;
     }
     if (abs((int)pulse2 - (int)DEFAULT_PULSE_US) <= PULSE_DEADZONE_US) {
-        pulse2 = DEFAULT_PULSE_US;
+      pulse2 = DEFAULT_PULSE_US;
     }
 
     // --- Map Pulse Width to Velocity ---
     float velocity1 = map_float(pulse1, MIN_PULSE_US, MAX_PULSE_US, -MAX_VELOCITY, MAX_VELOCITY);
     float velocity2 = map_float(pulse2, MIN_PULSE_US, MAX_PULSE_US, -MAX_VELOCITY, MAX_VELOCITY);
 
-    // Clamp values to the max velocity in case of over/under-shoot from RC receiver
+    // --- Final Safety Clamp (Redundant but good practice) ---
+    // The Sanity Check should prevent this from being necessary, but it's a good final protection.
     velocity1 = constrain(velocity1, -MAX_VELOCITY, MAX_VELOCITY);
     velocity2 = constrain(velocity2, -MAX_VELOCITY, MAX_VELOCITY);
     
     // --- Format and Send Serial Commands to ODrive ---
-    String command1 = "v 0 " + String(velocity1, 2) + "\n"; // "v 0 -15.75\n"
-    String command2 = "v 1 " + String(velocity2, 2) + "\n"; // "v 1 20.00\n"
+    String command1 = "v 0 " + String(velocity1, 2) + "\n"; // e.g. "v 0 -10.00\n"
+    String command2 = "v 1 " + String(velocity2, 2) + "\n"; // e.g. "v 1 10.00\n"
 
     ODRIVE_SERIAL.print(command1);
     ODRIVE_SERIAL.print(command2);
