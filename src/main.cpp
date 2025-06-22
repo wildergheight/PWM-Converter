@@ -1,24 +1,25 @@
 /*
- * ESP32 PWM to ODrive Serial (ASCII) Converter
+ * ESP32 PWM to ODrive Serial (ASCII) Converter with WebSerial
  * * Author: Gemini
- * * Date: June 19, 2025
- * * Version: 2.0 (With Sanity Check)
+ * * Date: June 22, 2025
+ * * Version: 2.1 (With WebSerial)
  * *
  * * Description:
  * This code reads two standard PWM signals from an RC receiver and converts them
  * into serial ASCII commands to control the velocity of two axes on an ODrive.
+ * It also hosts a WebSerial server over Wi-Fi for wireless debugging.
  * *
  * * How it works:
- * 1.  PWM Input: Uses pin change interrupts to measure the incoming RC pulse widths
- * asynchronously, just like the previous version.
- * 2.  Sanity Check & Failsafe: Includes a sanity check to reject out-of-range
- * PWM signals (preventing max-speed spikes) and a failsafe to handle total
- * signal loss. A deadzone around neutral prevents motor jitter.
- * 3.  Velocity Mapping: In the main loop, the measured pulse width (1000-2000µs)
- * is mapped to a velocity range (e.g., -10 to +10 turns/sec).
- * 4.  Serial Command Output: The ESP32 uses a second hardware serial port to send
- * ODrive ASCII protocol commands (e.g., "v 0 15.5\n") at a fixed rate. This
- * avoids flooding the ODrive with commands while maintaining responsive control.
+ * 1.  PWM Input: Uses pin change interrupts to measure incoming RC pulse widths.
+ * 2.  Sanity Check & Failsafe: Rejects out-of-range PWM signals and handles
+ * signal loss to prevent motor spikes or runaways.
+ * 3.  Velocity Mapping: In the main loop, the pulse width (1000-2000µs) is
+ * mapped to a velocity range (e.g., -10 to +10 turns/sec).
+ * 4.  ODrive Serial Output: Uses a hardware serial port (Serial2) to send
+ * ODrive ASCII protocol commands (e.g., "v 0 15.5\n").
+ * 5.  WebSerial Monitor: Connects to Wi-Fi and starts a web server. You can
+ * connect to it from a browser to see the same debug output that is sent
+ * to the USB serial port, allowing for wireless monitoring.
  *
  * Wiring:
  * - RC Receiver:
@@ -29,53 +30,50 @@
  * - Connect ESP32 GPIO 17 (TX2) to the ODrive's RX pin.
  * - Connect ESP32 GPIO 16 (RX2) to the ODrive's TX pin.
  * - Ensure a common ground (GND) between the ESP32 and the ODrive.
- * - USB (for Debugging):
- * - Connect the ESP32 to your computer via USB to view debug messages.
- *
- * ** IMPORTANT ODRIVE CONFIGURATION **
- * You must configure the ODrive's GPIO pins for UART communication. For example:
- * odrv0.config.enable_uart_a = True
- * odrv0.config.gpio(1)_mode = GpioMode.UART_A // Use your ODrive's correct TX pin
- * odrv0.config.gpio(2)_mode = GpioMode.UART_A // Use your ODrive's correct RX pin
- * odrv0.save_configuration()
- * And ensure the baud rate matches `ODRIVE_BAUD_RATE` below.
+ * - USB (for Debugging/Flashing):
+ * - Connect the ESP32 to your computer via USB.
  */
 
-// Include the main Arduino library header.
+// Include necessary libraries
 #include <Arduino.h>
+#include <WiFi.h>
+#include <ESPAsyncWebServer.h>
+#include <WebSerial.h>
 
 //================================================================================
 // Configuration
 //================================================================================
+
+// ★★★ NEW: WebSerial & Wi-Fi Config ★★★
+const char* ssid = "YOUR_WIFI_SSID";     // <-- Enter your Wi-Fi network name here
+const char* password = "YOUR_WIFI_PASSWORD"; // <-- Enter your Wi-Fi password here
+AsyncWebServer server(80); // Create AsyncWebServer object on port 80
 
 // --- PWM Input Pin Definitions ---
 const int PWM_INPUT_1 = 13; // For Axis 0
 const int PWM_INPUT_2 = 12; // For Axis 1
 
 // --- ODrive Serial Port Configuration ---
-// Using Serial2 for ODrive communication. Serial (UART0) is for USB debugging.
 #define ODRIVE_SERIAL Serial2
-const int ODRIVE_RX_PIN = 16; // GPIO 16 (ESP32 RX2) -> ODrive TX
-const int ODRIVE_TX_PIN = 17; // GPIO 17 (ESP32 TX2) -> ODrive RX
+const int ODRIVE_RX_PIN = 16;
+const int ODRIVE_TX_PIN = 17;
 const long ODRIVE_BAUD_RATE = 115200;
 
 // --- Control & Timing Configuration ---
-const unsigned int DEFAULT_PULSE_US = 1500; // Neutral RC signal
-const unsigned int MIN_PULSE_US = 1000;     // Full reverse RC signal
-const unsigned int MAX_PULSE_US = 2000;     // Full forward RC signal
-const int PULSE_DEADZONE_US = 40;           // Jitter prevention range (+/-)
+const unsigned int DEFAULT_PULSE_US = 1500;
+const unsigned int MIN_PULSE_US = 1000;
+const unsigned int MAX_PULSE_US = 2000;
+const int PULSE_DEADZONE_US = 25;
 
-const float MAX_VELOCITY = 10.0; // Max velocity in [turns/sec] at full stick
+const float MAX_VELOCITY = 10.0;
 
-// How often to send commands to ODrive (in milliseconds). 20ms = 50 Hz.
 const unsigned long COMMAND_INTERVAL_MS = 20;
-const unsigned long FAILSAFE_TIMEOUT_US = 100000; // 100 ms
+const unsigned long FAILSAFE_TIMEOUT_US = 100000;
 
 //================================================================================
 // Global Variables
 //================================================================================
 
-// For PWM input interrupts
 volatile unsigned long g_pulse1_start_time = 0;
 volatile unsigned long g_pulse2_start_time = 0;
 volatile unsigned int g_pulse1_width_us = DEFAULT_PULSE_US;
@@ -83,7 +81,6 @@ volatile unsigned int g_pulse2_width_us = DEFAULT_PULSE_US;
 volatile unsigned long g_last_pulse1_update_time = 0;
 volatile unsigned long g_last_pulse2_update_time = 0;
 
-// For timing the serial commands
 unsigned long g_last_command_time = 0;
 
 //================================================================================
@@ -109,13 +106,26 @@ void IRAM_ATTR isr_pwm2() {
 }
 
 //================================================================================
-// Helper Function
+// Helper Functions
 //================================================================================
 
-// Maps an input value from a source range to a target range (float version)
 float map_float(float x, float in_min, float in_max, float out_min, float out_max) {
   return (x - in_min) * (out_max - out_min) / (in_max - in_min) + out_min;
 }
+
+// ★★★ NEW: Callback function for handling messages from the WebSerial client ★★★
+void onWebSerialEvent(uint8_t *data, size_t len) {
+  WebSerial.println("Received...");
+  String msg = "";
+  for (size_t i = 0; i < len; i++) {
+    msg += (char)data[i];
+  }
+  WebSerial.print("Message from web: ");
+  WebSerial.println(msg);
+  Serial.print("Message from web: "); // Also print to USB for good measure
+  Serial.println(msg);
+}
+
 
 //================================================================================
 // Main Program: setup() and loop()
@@ -129,6 +139,25 @@ void setup() {
   // Start serial for ODrive communication
   ODRIVE_SERIAL.begin(ODRIVE_BAUD_RATE, SERIAL_8N1, ODRIVE_RX_PIN, ODRIVE_TX_PIN);
   Serial.println("ODrive serial port initialized.");
+
+  // ★★★ NEW: Wi-Fi and WebSerial Setup ★★★
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("\nWiFi connected!");
+  Serial.print("IP Address: ");
+  Serial.println(WiFi.localIP());
+
+  // Attach the WebSerial interface to the web server
+  WebSerial.begin(&server);
+  // Set up a callback for when messages are received
+  WebSerial.onMessage(onWebSerialEvent);
+  // Start the server
+  server.begin();
+  WebSerial.println("WebSerial is ready! Connect to this IP and go to /webserial");
+  // ★★★ End of WebSerial Setup ★★★
 
   // Configure PWM input pins
   pinMode(PWM_INPUT_1, INPUT_PULLUP);
@@ -158,7 +187,6 @@ void loop() {
     interrupts();
 
     // --- Apply Failsafe ---
-    // If we haven't received a fresh pulse in a while, reset to neutral.
     if (current_micros - last_pulse1_time > FAILSAFE_TIMEOUT_US) {
       pulse1 = DEFAULT_PULSE_US;
     }
@@ -166,9 +194,7 @@ void loop() {
       pulse2 = DEFAULT_PULSE_US;
     }
 
-    // ★★★ NEW CODE: Sanity Check ★★★
-    // This is the most important fix for the max-speed spikes.
-    // If the pulse is outside the valid range, it's a bad reading. Reset it.
+    // --- Sanity Check ---
     if (pulse1 < MIN_PULSE_US || pulse1 > MAX_PULSE_US) {
       pulse1 = DEFAULT_PULSE_US;
     }
@@ -177,7 +203,6 @@ void loop() {
     }
 
     // --- Apply Deadzone ---
-    // After validation, check if the pulse is in the neutral jitter zone.
     if (abs((int)pulse1 - (int)DEFAULT_PULSE_US) <= PULSE_DEADZONE_US) {
       pulse1 = DEFAULT_PULSE_US;
     }
@@ -189,20 +214,20 @@ void loop() {
     float velocity1 = map_float(pulse1, MIN_PULSE_US, MAX_PULSE_US, -MAX_VELOCITY, MAX_VELOCITY);
     float velocity2 = map_float(pulse2, MIN_PULSE_US, MAX_PULSE_US, -MAX_VELOCITY, MAX_VELOCITY);
 
-    // --- Final Safety Clamp (Redundant but good practice) ---
-    // The Sanity Check should prevent this from being necessary, but it's a good final protection.
+    // --- Final Safety Clamp ---
     velocity1 = constrain(velocity1, -MAX_VELOCITY, MAX_VELOCITY);
     velocity2 = constrain(velocity2, -MAX_VELOCITY, MAX_VELOCITY);
     
     // --- Format and Send Serial Commands to ODrive ---
-    String command1 = "v 0 " + String(velocity1, 2) + "\n"; // e.g. "v 0 -10.00\n"
-    String command2 = "v 1 " + String(velocity2, 2) + "\n"; // e.g. "v 1 10.00\n"
+    String command1 = "v 0 " + String(velocity1, 2) + "\n";
+    String command2 = "v 1 " + String(velocity2, 2) + "\n";
 
     ODRIVE_SERIAL.print(command1);
     ODRIVE_SERIAL.print(command2);
     
-    // --- Optional: Print debug info to USB serial ---
-    // Uncomment the line below for debugging.
-    Serial.println("Axis0: " + String(velocity1, 2) + " | Axis1: " + String(velocity2, 2));
+    // --- Send debug info to USB and WebSerial ---
+    String debug_msg = "Axis0: " + String(velocity1, 2) + " | Axis1: " + String(velocity2, 2);
+    Serial.println(debug_msg);
+    WebSerial.println(debug_msg); // ★★★ NEW: Mirror output to WebSerial ★★★
   }
 }
