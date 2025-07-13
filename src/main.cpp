@@ -63,9 +63,10 @@ const long ODRIVE_BAUD_RATE = 115200;
 const unsigned int DEFAULT_PULSE_US = 1500; // Neutral RC signal
 const unsigned int MIN_PULSE_US = 1000;     // Full reverse RC signal
 const unsigned int MAX_PULSE_US = 2000;     // Full forward RC signal
-const int PULSE_DEADZONE_US = 40;           // Jitter prevention range (+/-)
+const int PULSE_DEADZONE_US = 10;           // Jitter prevention range (+/-)
 
-const float MAX_VELOCITY = 10.0; // Max velocity in [turns/sec] at full stick
+const float MAX_VELOCITY = 5.0; // Max velocity in [turns/sec] at full stick
+const float MAX_TORQUE = 20.0; // Max torque in [Nm] at full stick. Adjust this value!
 
 // How often to send commands to ODrive (in milliseconds). 20ms = 50 Hz.
 const unsigned long COMMAND_INTERVAL_MS = 20;
@@ -185,24 +186,43 @@ void loop() {
       pulse2 = DEFAULT_PULSE_US;
     }
 
-    // --- Map Pulse Width to Velocity ---
-    float velocity1 = map_float(pulse1, MIN_PULSE_US, MAX_PULSE_US, -MAX_VELOCITY, MAX_VELOCITY);
-    float velocity2 = map_float(pulse2, MIN_PULSE_US, MAX_PULSE_US, -MAX_VELOCITY, MAX_VELOCITY);
+    // // --- Map Pulse Width to Velocity ---
+    // float velocity1 = map_float(pulse1, MIN_PULSE_US, MAX_PULSE_US, -MAX_VELOCITY, MAX_VELOCITY);
+    // float velocity2 = map_float(pulse2, MIN_PULSE_US, MAX_PULSE_US, -MAX_VELOCITY, MAX_VELOCITY);
 
-    // --- Final Safety Clamp (Redundant but good practice) ---
-    // The Sanity Check should prevent this from being necessary, but it's a good final protection.
-    velocity1 = constrain(velocity1, -MAX_VELOCITY, MAX_VELOCITY);
-    velocity2 = constrain(velocity2, -MAX_VELOCITY, MAX_VELOCITY);
+    // // --- Final Safety Clamp (Redundant but good practice) ---
+    // // The Sanity Check should prevent this from being necessary, but it's a good final protection.
+    // velocity1 = constrain(velocity1, -MAX_VELOCITY, MAX_VELOCITY);
+    // velocity2 = constrain(velocity2, -MAX_VELOCITY, MAX_VELOCITY);
     
-    // --- Format and Send Serial Commands to ODrive ---
-    String command1 = "v 0 " + String(velocity1, 2) + "\n"; // e.g. "v 0 -10.00\n"
-    String command2 = "v 1 " + String(velocity2, 2) + "\n"; // e.g. "v 1 10.00\n"
+    // // --- Format and Send Serial Commands to ODrive ---
+    // String command1 = "v 0 " + String(velocity1, 2) + "\n"; // e.g. "v 0 -10.00\n"
+    // String command2 = "v 1 " + String(velocity2, 2) + "\n"; // e.g. "v 1 10.00\n"
+
+    // ODRIVE_SERIAL.print(command1);
+    // ODRIVE_SERIAL.print(command2);
+    
+    // // --- Optional: Print debug info to USB serial ---
+    // // Uncomment the line below for debugging.
+    // Serial.println("Axis0: " + String(velocity1, 2) + " | Axis1: " + String(velocity2, 2));
+
+    // --- Map Pulse Width to Torque (INSTEAD OF VELOCITY) ---
+    float torque1 = map_float(pulse1, MIN_PULSE_US, MAX_PULSE_US, -MAX_TORQUE, MAX_TORQUE);
+    float torque2 = map_float(pulse2, MIN_PULSE_US, MAX_PULSE_US, -MAX_TORQUE, MAX_TORQUE);
+
+    // --- Final Safety Clamp ---
+    torque1 = constrain(torque1, -MAX_TORQUE, MAX_TORQUE);
+    torque2 = constrain(torque2, -MAX_TORQUE, MAX_TORQUE);
+    
+    // --- Format and Send Serial Commands to ODrive (MODIFIED) ---
+    String command1 = "c 0 " + String(torque1, 2) + "\n"; // e.g. "c 0 -1.00\n"
+    String command2 = "c 1 " + String(torque2, 2) + "\n"; // e.g. "c 1 1.00\n"
 
     ODRIVE_SERIAL.print(command1);
     ODRIVE_SERIAL.print(command2);
     
     // --- Optional: Print debug info to USB serial ---
     // Uncomment the line below for debugging.
-    Serial.println("Axis0: " + String(velocity1, 2) + " | Axis1: " + String(velocity2, 2));
+    Serial.println("Axis0 Torque: " + String(torque1, 2) + " | Axis1 Torque: " + String(torque2, 2));
   }
 }
