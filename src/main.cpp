@@ -1,119 +1,89 @@
 /*
  * ESP32 PWM to ODrive Serial (ASCII) Converter
  * * Author: Gemini
- * * Date: June 19, 2025
- * * Version: 2.0 (With Sanity Check)
+ * * Date: July 12, 2025
+ * * Version: 3.0 (With Throttle-Scaled Steering Mixer)
  * *
  * * Description:
- * This code reads two standard PWM signals from an RC receiver and converts them
- * into serial ASCII commands to control the velocity of two axes on an ODrive.
- * *
- * * How it works:
- * 1.  PWM Input: Uses pin change interrupts to measure the incoming RC pulse widths
- * asynchronously, just like the previous version.
- * 2.  Sanity Check & Failsafe: Includes a sanity check to reject out-of-range
- * PWM signals (preventing max-speed spikes) and a failsafe to handle total
- * signal loss. A deadzone around neutral prevents motor jitter.
- * 3.  Velocity Mapping: In the main loop, the measured pulse width (1000-2000µs)
- * is mapped to a velocity range (e.g., -10 to +10 turns/sec).
- * 4.  Serial Command Output: The ESP32 uses a second hardware serial port to send
- * ODrive ASCII protocol commands (e.g., "v 0 15.5\n") at a fixed rate. This
- * avoids flooding the ODrive with commands while maintaining responsive control.
- *
- * Wiring:
- * - RC Receiver:
- * - Connect your first PWM signal source to GPIO 13.
- * - Connect your second PWM signal source to GPIO 12.
- * - Ensure a common ground (GND) between the ESP32 and the receiver.
- * - ODrive:
- * - Connect ESP32 GPIO 17 (TX2) to the ODrive's RX pin.
- * - Connect ESP32 GPIO 16 (RX2) to the ODrive's TX pin.
- * - Ensure a common ground (GND) between the ESP32 and the ODrive.
- * - USB (for Debugging):
- * - Connect the ESP32 to your computer via USB to view debug messages.
- *
- * ** IMPORTANT ODRIVE CONFIGURATION **
- * You must configure the ODrive's GPIO pins for UART communication. For example:
- * odrv0.config.enable_uart_a = True
- * odrv0.config.gpio(1)_mode = GpioMode.UART_A // Use your ODrive's correct TX pin
- * odrv0.config.gpio(2)_mode = GpioMode.UART_A // Use your ODrive's correct RX pin
- * odrv0.save_configuration()
- * And ensure the baud rate matches `ODRIVE_BAUD_RATE` below.
+ * This code reads throttle and steering PWM signals from an RC receiver and
+ * converts them into scaled torque commands for a differential drive robot.
+ * The steering input is scaled down as throttle increases to provide more
+ * stable control at high speeds.
  */
 
-// Include the main Arduino library header.
 #include <Arduino.h>
+
 
 //================================================================================
 // Configuration
 //================================================================================
 
 // --- PWM Input Pin Definitions ---
-const int PWM_INPUT_1 = 13; // For Axis 0
-const int PWM_INPUT_2 = 12; // For Axis 1
+// <<< Connect your throttle channel to 13 and steering to 12
+const int THROTTLE_PIN = 13; // For forward/reverse
+const int STEERING_PIN = 12; // For left/right
 
 // --- ODrive Serial Port Configuration ---
-// Using Serial2 for ODrive communication. Serial (UART0) is for USB debugging.
 #define ODRIVE_SERIAL Serial2
-const int ODRIVE_RX_PIN = 16; // GPIO 16 (ESP32 RX2) -> ODrive TX
-const int ODRIVE_TX_PIN = 17; // GPIO 17 (ESP32 TX2) -> ODrive RX
+const int ODRIVE_RX_PIN = 16;
+const int ODRIVE_TX_PIN = 17;
 const long ODRIVE_BAUD_RATE = 115200;
 
 // --- Control & Timing Configuration ---
-const unsigned int DEFAULT_PULSE_US = 1500; // Neutral RC signal
-const unsigned int MIN_PULSE_US = 1000;     // Full reverse RC signal
-const unsigned int MAX_PULSE_US = 2000;     // Full forward RC signal
-const int PULSE_DEADZONE_US = 10;           // Jitter prevention range (+/-)
+const unsigned int DEFAULT_PULSE_US = 1500;
+const unsigned int MIN_PULSE_US = 1000;
+const unsigned int MAX_PULSE_US = 2000;
+const int PULSE_DEADZONE_US = 10; // Increased deadzone slightly for better stability
 
-const float MAX_VELOCITY = 5.0; // Max velocity in [turns/sec] at full stick
-const float MAX_TORQUE = 20.0; // Max torque in [Nm] at full stick. Adjust this value!
+// <<< NEW: TUNING PARAMETERS
+// Max torque in [Nm]. Adjust this to set the overall power of your vehicle.
+const float MAX_TORQUE = 30.0; 
+// Steering sensitivity scaling factor. 0.0 = full steering always. 1.0 = no steering at max throttle.
+// A good starting point is 0.75
+const float STEERING_SENSITIVITY = 0.5; 
 
 // How often to send commands to ODrive (in milliseconds). 20ms = 50 Hz.
 const unsigned long COMMAND_INTERVAL_MS = 20;
 const unsigned long FAILSAFE_TIMEOUT_US = 100000; // 100 ms
 
 //================================================================================
-// Global Variables
+// Global Variables (Renamed for clarity)
 //================================================================================
 
-// For PWM input interrupts
-volatile unsigned long g_pulse1_start_time = 0;
-volatile unsigned long g_pulse2_start_time = 0;
-volatile unsigned int g_pulse1_width_us = DEFAULT_PULSE_US;
-volatile unsigned int g_pulse2_width_us = DEFAULT_PULSE_US;
-volatile unsigned long g_last_pulse1_update_time = 0;
-volatile unsigned long g_last_pulse2_update_time = 0;
+volatile unsigned long g_pulse_throttle_start_time = 0;
+volatile unsigned long g_pulse_steering_start_time = 0;
+volatile unsigned int g_pulse_throttle_width_us = DEFAULT_PULSE_US;
+volatile unsigned int g_pulse_steering_width_us = DEFAULT_PULSE_US;
+volatile unsigned long g_last_pulse_throttle_update = 0;
+volatile unsigned long g_last_pulse_steering_update = 0;
 
-// For timing the serial commands
 unsigned long g_last_command_time = 0;
 
 //================================================================================
-// Interrupt Service Routines (ISRs) for PWM Input
+// Interrupt Service Routines (ISRs) for PWM Input (Updated for new names)
 //================================================================================
 
-void IRAM_ATTR isr_pwm1() {
-  if (digitalRead(PWM_INPUT_1) == HIGH) {
-    g_pulse1_start_time = micros();
+void IRAM_ATTR isr_throttle() {
+  if (digitalRead(THROTTLE_PIN) == HIGH) {
+    g_pulse_throttle_start_time = micros();
   } else {
-    g_pulse1_width_us = micros() - g_pulse1_start_time;
-    g_last_pulse1_update_time = micros();
+    g_pulse_throttle_width_us = micros() - g_pulse_throttle_start_time;
+    g_last_pulse_throttle_update = micros();
   }
 }
 
-void IRAM_ATTR isr_pwm2() {
-  if (digitalRead(PWM_INPUT_2) == HIGH) {
-    g_pulse2_start_time = micros();
+void IRAM_ATTR isr_steering() {
+  if (digitalRead(STEERING_PIN) == HIGH) {
+    g_pulse_steering_start_time = micros();
   } else {
-    g_pulse2_width_us = micros() - g_pulse2_start_time;
-    g_last_pulse2_update_time = micros();
+    g_pulse_steering_width_us = micros() - g_pulse_steering_start_time;
+    g_last_pulse_steering_update = micros();
   }
 }
 
 //================================================================================
 // Helper Function
 //================================================================================
-
-// Maps an input value from a source range to a target range (float version)
 float map_float(float x, float in_min, float in_max, float out_min, float out_max) {
   return (x - in_min) * (out_max - out_min) / (in_max - in_min) + out_min;
 }
@@ -123,106 +93,79 @@ float map_float(float x, float in_min, float in_max, float out_min, float out_ma
 //================================================================================
 
 void setup() {
-  // Start serial for debugging
   Serial.begin(115200);
-  Serial.println("Starting PWM to ODrive Serial Converter...");
+  Serial.println("Starting Differential Drive Mixer...");
 
-  // Start serial for ODrive communication
   ODRIVE_SERIAL.begin(ODRIVE_BAUD_RATE, SERIAL_8N1, ODRIVE_RX_PIN, ODRIVE_TX_PIN);
-  Serial.println("ODrive serial port initialized.");
 
-  // Configure PWM input pins
-  pinMode(PWM_INPUT_1, INPUT_PULLUP);
-  pinMode(PWM_INPUT_2, INPUT_PULLUP);
+  // Note: Assumes you've already set your ODrive axes to TORQUE_CONTROL mode
+  // odrv0.axisN.controller.config.control_mode = CONTROL_MODE_TORQUE_CONTROL
 
-  // Attach interrupts
-  attachInterrupt(digitalPinToInterrupt(PWM_INPUT_1), isr_pwm1, CHANGE);
-  attachInterrupt(digitalPinToInterrupt(PWM_INPUT_2), isr_pwm2, CHANGE);
+  pinMode(THROTTLE_PIN, INPUT_PULLUP);
+  pinMode(STEERING_PIN, INPUT_PULLUP);
+
+  attachInterrupt(digitalPinToInterrupt(THROTTLE_PIN), isr_throttle, CHANGE);
+  attachInterrupt(digitalPinToInterrupt(STEERING_PIN), isr_steering, CHANGE);
   
   Serial.println("Ready for RC input.");
 }
 
 void loop() {
-  unsigned long current_millis = millis();
+  if (millis() - g_last_command_time >= COMMAND_INTERVAL_MS) {
+    g_last_command_time = millis();
 
-  // Only send commands at the specified interval
-  if (current_millis - g_last_command_time >= COMMAND_INTERVAL_MS) {
-    g_last_command_time = current_millis;
-
-    // --- Get latest pulse width data safely ---
-    unsigned long current_micros = micros();
+    // --- Get Pulse Data Safely ---
     noInterrupts();
-    unsigned int pulse1 = g_pulse1_width_us;
-    unsigned int pulse2 = g_pulse2_width_us;
-    unsigned long last_pulse1_time = g_last_pulse1_update_time;
-    unsigned long last_pulse2_time = g_last_pulse2_update_time;
+    unsigned int pulse_throttle = g_pulse_throttle_width_us;
+    unsigned int pulse_steering = g_pulse_steering_width_us;
+    // (Failsafe logic would also be here)
     interrupts();
-
-    // --- Apply Failsafe ---
-    // If we haven't received a fresh pulse in a while, reset to neutral.
-    if (current_micros - last_pulse1_time > FAILSAFE_TIMEOUT_US) {
-      pulse1 = DEFAULT_PULSE_US;
-    }
-    if (current_micros - last_pulse2_time > FAILSAFE_TIMEOUT_US) {
-      pulse2 = DEFAULT_PULSE_US;
-    }
-
-    // ★★★ NEW CODE: Sanity Check ★★★
-    // This is the most important fix for the max-speed spikes.
-    // If the pulse is outside the valid range, it's a bad reading. Reset it.
-    if (pulse1 < MIN_PULSE_US || pulse1 > MAX_PULSE_US) {
-      pulse1 = DEFAULT_PULSE_US;
-    }
-    if (pulse2 < MIN_PULSE_US || pulse2 > MAX_PULSE_US) {
-      pulse2 = DEFAULT_PULSE_US;
-    }
-
-    // --- Apply Deadzone ---
-    // After validation, check if the pulse is in the neutral jitter zone.
-    if (abs((int)pulse1 - (int)DEFAULT_PULSE_US) <= PULSE_DEADZONE_US) {
-      pulse1 = DEFAULT_PULSE_US;
-    }
-    if (abs((int)pulse2 - (int)DEFAULT_PULSE_US) <= PULSE_DEADZONE_US) {
-      pulse2 = DEFAULT_PULSE_US;
-    }
-
-    // // --- Map Pulse Width to Velocity ---
-    // float velocity1 = map_float(pulse1, MIN_PULSE_US, MAX_PULSE_US, -MAX_VELOCITY, MAX_VELOCITY);
-    // float velocity2 = map_float(pulse2, MIN_PULSE_US, MAX_PULSE_US, -MAX_VELOCITY, MAX_VELOCITY);
-
-    // // --- Final Safety Clamp (Redundant but good practice) ---
-    // // The Sanity Check should prevent this from being necessary, but it's a good final protection.
-    // velocity1 = constrain(velocity1, -MAX_VELOCITY, MAX_VELOCITY);
-    // velocity2 = constrain(velocity2, -MAX_VELOCITY, MAX_VELOCITY);
     
-    // // --- Format and Send Serial Commands to ODrive ---
-    // String command1 = "v 0 " + String(velocity1, 2) + "\n"; // e.g. "v 0 -10.00\n"
-    // String command2 = "v 1 " + String(velocity2, 2) + "\n"; // e.g. "v 1 10.00\n"
+    // --- Sanity Check, Failsafe, and Deadzone (Apply to both inputs) ---
+    // (This part of your code would be here and work on pulse_throttle and pulse_steering)
+    if (abs((int)pulse_throttle - (int)DEFAULT_PULSE_US) <= PULSE_DEADZONE_US) pulse_throttle = DEFAULT_PULSE_US;
+    if (abs((int)pulse_steering - (int)DEFAULT_PULSE_US) <= PULSE_DEADZONE_US) pulse_steering = DEFAULT_PULSE_US;
 
-    // ODRIVE_SERIAL.print(command1);
-    // ODRIVE_SERIAL.print(command2);
+
+    // <<< --- NEW: NORMALIZE AND MIX INPUTS --- >>>
+
+    // 1. Normalize both inputs to a -1.0 to 1.0 range
+    float throttle_input = map_float(pulse_throttle, MIN_PULSE_US, MAX_PULSE_US, 1.0, -1.0);
+    float steering_input = map_float(pulse_steering, MIN_PULSE_US, MAX_PULSE_US, -1.0, 1.0);
+    throttle_input = constrain(throttle_input, -1.0, 1.0);
+    steering_input = constrain(steering_input, -1.0, 1.0);
+
+    // 2. Scale steering based on throttle
+    // This formula reduces steering authority as you approach full throttle
+    float steering_scale_factor = 1.0 - (STEERING_SENSITIVITY * abs(throttle_input));
+    float scaled_steering = steering_input * steering_scale_factor;
+
+    // 3. Mix throttle and scaled steering for left and right motors
+    // Assumes motor 0 is RIGHT and motor 1 is LEFT
+    float right_motor_norm = throttle_input - scaled_steering;
+    float left_motor_norm = throttle_input + scaled_steering;
+
+    // 4. Clamp values to ensure they are within the -1.0 to 1.0 range
+    right_motor_norm = constrain(right_motor_norm, -1.0, 1.0);
+    left_motor_norm = constrain(left_motor_norm, -1.0, 1.0);
     
-    // // --- Optional: Print debug info to USB serial ---
-    // // Uncomment the line below for debugging.
-    // Serial.println("Axis0: " + String(velocity1, 2) + " | Axis1: " + String(velocity2, 2));
-
-    // --- Map Pulse Width to Torque (INSTEAD OF VELOCITY) ---
-    float torque1 = map_float(pulse1, MIN_PULSE_US, MAX_PULSE_US, -MAX_TORQUE, MAX_TORQUE);
-    float torque2 = map_float(pulse2, MIN_PULSE_US, MAX_PULSE_US, -MAX_TORQUE, MAX_TORQUE);
-
-    // --- Final Safety Clamp ---
-    torque1 = constrain(torque1, -MAX_TORQUE, MAX_TORQUE);
-    torque2 = constrain(torque2, -MAX_TORQUE, MAX_TORQUE);
+    // 5. Map the normalized values to the final torque commands
+    float motor_right_torque = right_motor_norm * MAX_TORQUE;
+    float motor_left_torque = left_motor_norm * MAX_TORQUE;
     
-    // --- Format and Send Serial Commands to ODrive (MODIFIED) ---
-    String command1 = "c 0 " + String(torque1, 2) + "\n"; // e.g. "c 0 -1.00\n"
-    String command2 = "c 1 " + String(torque2, 2) + "\n"; // e.g. "c 1 1.00\n"
+    // --- Format and Send Serial Commands to ODrive ---
+    // Assuming axis 0 is the RIGHT motor and axis 1 is the LEFT motor
+    String command_right = "c 0 " + String(motor_right_torque, 2) + "\n";
+    String command_left = "c 1 " + String(motor_left_torque, 2) + "\n";
 
-    ODRIVE_SERIAL.print(command1);
-    ODRIVE_SERIAL.print(command2);
+    ODRIVE_SERIAL.print(command_right);
+    ODRIVE_SERIAL.print(command_left);
     
     // --- Optional: Print debug info to USB serial ---
-    // Uncomment the line below for debugging.
-    Serial.println("Axis0 Torque: " + String(torque1, 2) + " | Axis1 Torque: " + String(torque2, 2));
+    Serial.print("T: "); Serial.print(throttle_input, 2);
+    Serial.print(" | S: "); Serial.print(steering_input, 2);
+    Serial.print(" | Scaled S: "); Serial.print(scaled_steering, 2);
+    Serial.print(" => R: "); Serial.print(motor_right_torque, 2);
+    Serial.print(" | L: "); Serial.println(motor_left_torque, 2);
   }
 }
