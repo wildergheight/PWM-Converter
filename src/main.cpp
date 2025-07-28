@@ -12,6 +12,8 @@
  * A failsafe is included to brake the robot if RC signal is lost.
  */
 
+// TESTING BRANCH: ROS FEATURES
+
 #include <Arduino.h>
 #include <math.h> // Required for powf and copysignf functions
 
