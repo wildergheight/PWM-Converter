@@ -1,32 +1,28 @@
 /*
- * ESP32 PWM/Serial to ODrive Serial (ASCII) Converter
+ * ESP32 ESP-NOW/Serial to ODrive Serial (ASCII) Converter
  * * Author: Gemini
- * * Date: August 9, 2025
- * * Version: 8.0 (Velocity Control for Automation)
+ * * Date: August 25, 2025
+ * * Version: 9.0 (ESP-NOW Control)
  * *
  * * Description:
- * This version uses two different control modes. Manual RC control uses torque
- * with an exponential curve and rate limiter for a responsive feel. Automated
- * control (via USB) uses velocity control for stable, predictable movement.
- * The ESP32 automatically switches the ODrive's control mode based on input.
- *
+ * This code receives control commands from a remote (e.g., a T-Beam) via
+ * ESP-NOW and translates them into ODrive torque commands. It retains the
+ * ability to be overridden by velocity commands from a host computer via USB.
+ * 
  * Control Priority & Mode:
- * 1. RC Brake/Failsafe (Highest): Velocity Control (0 vel)
+ * 1. ESP-NOW Failsafe (Highest): Velocity Control (0 vel)
  * 2. Automation Serial Command (USB): Velocity Control
- * 3. RC Control (Lowest): Torque Control
+ * 3. ESP-NOW Control (Lowest): Torque Control
  */
 
 #include <Arduino.h>
 #include <math.h>
+#include <esp_now.h>
+#include <WiFi.h>
 
 //================================================================================
 // Configuration
 //================================================================================
-
-// --- PWM Input Pin Definitions ---
-const int THROTTLE_PIN = 13;
-const int STEERING_PIN = 12;
-const int BRAKE_PIN = 14;
 
 // --- ODrive Serial Port Configuration ---
 #define ODRIVE_SERIAL Serial2
@@ -38,41 +34,46 @@ const long ODRIVE_BAUD_RATE = 115200;
 #define AUTO_SERIAL Serial
 const long AUTO_BAUD_RATE = 115200;
 
-// --- Control & Timing Configuration ---
-const unsigned int DEFAULT_PULSE_US = 1500;
-const unsigned int MIN_PULSE_US = 1000;
-const unsigned int MAX_PULSE_US = 2000;
-const int PULSE_DEADZONE_US = 10;
-const unsigned int BRAKE_ON_THRESHOLD_US = 1500;
-
 // --- Tuning Parameters ---
-// FOR RC (Torque) MODE:
 const float MAX_TORQUE = 30.0;
 const float STEERING_SENSITIVITY = 0.5;
-const float THROTTLE_EXPO = 2.0;
-const float MAX_TORQUE_CHANGE_PER_CYCLE = 1.0;
-// FOR AUTOMATION (Velocity) MODE:
-const float MAX_VELOCITY_RPS = 2.0; // Revolutions Per Second
+const float THROTTLE_EXPO = 2.3;
+
+const float MAX_VELOCITY_RPS = 2.0;
+
+// --- Battery & Low Voltage Cutoff ---
+const bool ENABLE_LOW_VOLTAGE_CUTOFF = true;
+// IMPORTANT: Set this to a SAFE voltage for your battery pack.
+// For a 36V 10S Li-ion pack, 32V (3.2V/cell) is a safe cutoff point.
+const float LOW_VOLTAGE_CUTOFF = 32.0; 
+const unsigned long VOLTAGE_CHECK_INTERVAL_MS = 2000; // Check voltage every 2 seconds
 
 // --- Failsafe and Timing ---
 const unsigned long COMMAND_INTERVAL_MS = 20;
-const unsigned long RC_FAILSAFE_TIMEOUT_US = 100000; // 100 ms
-const unsigned long AUTO_FAILSAFE_TIMEOUT_MS = 500;  // Fallback to RC after 500ms
+const unsigned long ESPNOW_FAILSAFE_TIMEOUT_MS = 500; // Fallback to brake after 500ms
+const unsigned long AUTO_FAILSAFE_TIMEOUT_MS = 500;   // Fallback to ESP-NOW after 500ms
+
+// --- Torque Ramp Rate ---
+const float TORQUE_RAMP_RATE = 1.0;  // [Nm/sec]
+const float MAX_TORQUE_CHANGE_PER_CYCLE = TORQUE_RAMP_RATE * (COMMAND_INTERVAL_MS / 1000.0);
 
 //================================================================================
 // Global Variables
 //================================================================================
 
 // --- State Machine for Control ---
-enum ControlState { STATE_TORQUE_RC, STATE_VELOCITY_AUTO, STATE_BRAKING };
-ControlState g_control_state = STATE_TORQUE_RC;
+enum ControlState { STATE_TORQUE_ESPNOW, STATE_VELOCITY_AUTO, STATE_BRAKING, STATE_LOW_VOLTAGE_CUTOFF };
+ControlState g_control_state = STATE_BRAKING; // Start in BRAKING state for safety
 
-// --- PWM Input Variables ---
-volatile unsigned long g_pulse_throttle_start_time, g_pulse_steering_start_time, g_pulse_brake_start_time;
-volatile unsigned int g_pulse_throttle_width_us = DEFAULT_PULSE_US;
-volatile unsigned int g_pulse_steering_width_us = DEFAULT_PULSE_US;
-volatile unsigned int g_pulse_brake_width_us = MIN_PULSE_US;
-volatile unsigned long g_last_pulse_throttle_update, g_last_pulse_steering_update, g_last_pulse_brake_update;
+// --- ESP-NOW Data ---
+typedef struct ControlData {
+    float throttle;
+    float steering;
+    bool button_state;  // ADDED: 0 for off, 1 for on
+} ControlData;
+
+ControlData espnowData;
+volatile unsigned long g_last_espnow_command_time = 0;
 
 // --- Automation Command Variables ---
 String g_auto_serial_buffer = "";
@@ -84,25 +85,48 @@ unsigned long g_last_auto_command_time = 0;
 float g_last_sent_right_torque = 0.0;
 float g_last_sent_left_torque = 0.0;
 
+// --- Voltage & LVC Variables ---
+float g_bus_voltage = 0.0; // Stores the last read voltage from ODrive
+unsigned long g_last_voltage_check_time = 0;
+bool g_lvc_activated = false; // Latches the LVC state once triggered
+
+
 unsigned long g_last_command_time = 0;
 
 //================================================================================
-// Interrupt Service Routines (ISRs) for PWM Input
+// ESP-NOW Callback
 //================================================================================
-void IRAM_ATTR isr_throttle() { if (digitalRead(THROTTLE_PIN)) g_pulse_throttle_start_time = micros(); else { g_pulse_throttle_width_us = micros() - g_pulse_throttle_start_time; g_last_pulse_throttle_update = micros(); } }
-void IRAM_ATTR isr_steering() { if (digitalRead(STEERING_PIN)) g_pulse_steering_start_time = micros(); else { g_pulse_steering_width_us = micros() - g_pulse_steering_start_time; g_last_pulse_steering_update = micros(); } }
-void IRAM_ATTR isr_brake() { if (digitalRead(BRAKE_PIN)) g_pulse_brake_start_time = micros(); else { g_pulse_brake_width_us = micros() - g_pulse_brake_start_time; g_last_pulse_brake_update = micros(); } }
+void onDataRecv(const uint8_t * mac, const uint8_t *incomingData, int len) {
+    memcpy(&espnowData, incomingData, sizeof(espnowData));
+    g_last_espnow_command_time = millis();
+}
 
 //================================================================================
-// Helper Function
+// Helper & Automation Parsing Functions
 //================================================================================
 float map_float(float x, float in_min, float in_max, float out_min, float out_max) {
     return (x - in_min) * (out_max - out_min) / (in_max - in_min) + out_min;
 }
 
-//================================================================================
-// Automation Serial Parsing
-//================================================================================
+void checkODriveVoltage() {
+    // Periodically ask the ODrive for its voltage
+    if (ENABLE_LOW_VOLTAGE_CUTOFF && millis() - g_last_voltage_check_time > VOLTAGE_CHECK_INTERVAL_MS) {
+        ODRIVE_SERIAL.println("r vbus_voltage");
+        g_last_voltage_check_time = millis();
+    }
+
+    // Check if the ODrive has sent a reply
+    while (ODRIVE_SERIAL.available()) {
+        String response = ODRIVE_SERIAL.readStringUntil('\n');
+        float parsed_voltage = response.toFloat();
+        // Basic validation to filter out noise or parsing errors
+        if (parsed_voltage > 10.0) { 
+            g_bus_voltage = parsed_voltage;
+            AUTO_SERIAL.println("VBUS: " + String(g_bus_voltage) + "V");
+        }
+    }
+}
+
 void parseAutoCommand(String cmd) {
     cmd.trim();
     int r_idx = cmd.indexOf('R');
@@ -138,19 +162,26 @@ void setup() {
     AUTO_SERIAL.begin(AUTO_BAUD_RATE);
     ODRIVE_SERIAL.begin(ODRIVE_BAUD_RATE, SERIAL_8N1, ODRIVE_RX_PIN, ODRIVE_TX_PIN);
     
-    pinMode(THROTTLE_PIN, INPUT_PULLUP);
-    pinMode(STEERING_PIN, INPUT_PULLUP);
-    pinMode(BRAKE_PIN, INPUT_PULLUP);
+    AUTO_SERIAL.println("ESP32 ODrive Bridge v9.0 (ESP-NOW) Ready.");
     
-    attachInterrupt(digitalPinToInterrupt(THROTTLE_PIN), isr_throttle, CHANGE);
-    attachInterrupt(digitalPinToInterrupt(STEERING_PIN), isr_steering, CHANGE);
-    attachInterrupt(digitalPinToInterrupt(BRAKE_PIN), isr_brake, CHANGE);
+    // Set device as a Wi-Fi Station
+    WiFi.mode(WIFI_STA);
+    AUTO_SERIAL.print("My MAC Address: ");
+    AUTO_SERIAL.println(WiFi.macAddress());
+
+    // Initialize ESP-NOW
+    if (esp_now_init() != ESP_OK) {
+        AUTO_SERIAL.println("Error initializing ESP-NOW");
+        return;
+    }
     
-    AUTO_SERIAL.println("ESP32 ODrive Bridge v8.0 Ready.");
+    // Register the receive callback
+    esp_now_register_recv_cb(onDataRecv);
 }
 
 void loop() {
     checkAutoSerial();
+    checkODriveVoltage(); // Ask for and parse ODrive voltage
 
     if (millis() - g_last_command_time < COMMAND_INTERVAL_MS) return;
     g_last_command_time = millis();
@@ -158,41 +189,34 @@ void loop() {
     // --- DETERMINE CONTROL STATE ---
     ControlState desired_state;
     
-    noInterrupts();
-    unsigned long last_rc_update = g_last_pulse_throttle_update;
-    unsigned int brake_pulse = g_pulse_brake_width_us;
-    interrupts();
-    
-    bool rc_failsafe = (micros() - last_rc_update > RC_FAILSAFE_TIMEOUT_US);
-    bool brake_switch_on = (brake_pulse > BRAKE_ON_THRESHOLD_US);
+    bool espnow_failsafe = (millis() - g_last_espnow_command_time > ESPNOW_FAILSAFE_TIMEOUT_MS);
+    bool auto_override = (millis() - g_last_auto_command_time < AUTO_FAILSAFE_TIMEOUT_MS);
 
-    if (rc_failsafe || brake_switch_on) {
+    if (espnow_failsafe || espnowData.button_state) {
         desired_state = STATE_BRAKING;
-    } else if (millis() - g_last_auto_command_time < AUTO_FAILSAFE_TIMEOUT_MS) {
+    } else if (auto_override) {
         desired_state = STATE_VELOCITY_AUTO;
     } else {
-        desired_state = STATE_TORQUE_RC;
+        desired_state = STATE_TORQUE_ESPNOW;
     }
 
     // --- HANDLE ODRIVE MODE TRANSITIONS ---
     if (desired_state != g_control_state) {
-        // To BRAKING or AUTO from TORQUE_RC -> Switch to Velocity Control
-        if ((desired_state == STATE_BRAKING || desired_state == STATE_VELOCITY_AUTO) && g_control_state == STATE_TORQUE_RC) {
+        if ((desired_state == STATE_BRAKING || desired_state == STATE_VELOCITY_AUTO || desired_state == STATE_LOW_VOLTAGE_CUTOFF) && g_control_state == STATE_TORQUE_ESPNOW) {
             AUTO_SERIAL.println("STATE: Switching ODrive to VELOCITY_CONTROL");
             ODRIVE_SERIAL.println("w 0.controller.config.control_mode 2");
             ODRIVE_SERIAL.println("w 1.controller.config.control_mode 2");
-        } 
-        // To TORQUE_RC from any other state -> Switch to Torque Control
-        else if (desired_state == STATE_TORQUE_RC && g_control_state != STATE_TORQUE_RC) {
+        } else if (desired_state == STATE_TORQUE_ESPNOW && g_control_state != STATE_TORQUE_ESPNOW) {
             AUTO_SERIAL.println("STATE: Switching ODrive to TORQUE_CONTROL");
             ODRIVE_SERIAL.println("w 0.controller.config.control_mode 1");
             ODRIVE_SERIAL.println("w 1.controller.config.control_mode 1");
         }
-        
-        // Reset torque rate limiter when leaving torque mode
-        if (g_control_state == STATE_TORQUE_RC) {
-            g_last_sent_right_torque = 0.0;
-            g_last_sent_left_torque = 0.0;
+
+        // When LVC is triggered for the first time
+        if(desired_state == STATE_LOW_VOLTAGE_CUTOFF && !g_lvc_activated){
+            g_lvc_activated = true; // Latch the LVC state
+            AUTO_SERIAL.println("!!! LOW VOLTAGE CUTOFF ACTIVATED !!!");
+            AUTO_SERIAL.println("Voltage: " + String(g_bus_voltage) + "V. System halted.");
         }
 
         g_control_state = desired_state;
@@ -201,9 +225,19 @@ void loop() {
 
     // --- EXECUTE ACTION BASED ON STATE ---
     switch(g_control_state) {
+        case STATE_LOW_VOLTAGE_CUTOFF:
+            // This is the highest priority state. Brakes are applied and held.
+            ODRIVE_SERIAL.println("v 0 0");
+            ODRIVE_SERIAL.println("v 1 0");
+            break;
+
         case STATE_BRAKING:
             ODRIVE_SERIAL.println("v 0 0");
             ODRIVE_SERIAL.println("v 1 0");
+
+            // AUTO_SERIAL.print("v 0 0 ");
+            // AUTO_SERIAL.println("v 1 0");
+                
             break;
 
         case STATE_VELOCITY_AUTO:
@@ -215,18 +249,13 @@ void loop() {
             }
             break;
 
-        case STATE_TORQUE_RC:
+        case STATE_TORQUE_ESPNOW:
             {
-                noInterrupts();
-                unsigned int pulse_throttle = g_pulse_throttle_width_us;
-                unsigned int pulse_steering = g_pulse_steering_width_us;
-                interrupts();
+                float throttle_input = espnowData.steering;
+                float steering_input = espnowData.throttle;
 
-                if (abs((int)pulse_throttle - (int)DEFAULT_PULSE_US) <= PULSE_DEADZONE_US) pulse_throttle = DEFAULT_PULSE_US;
-                if (abs((int)pulse_steering - (int)DEFAULT_PULSE_US) <= PULSE_DEADZONE_US) pulse_steering = DEFAULT_PULSE_US;
-                
-                float throttle_input = map_float(pulse_throttle, MIN_PULSE_US, MAX_PULSE_US, 1.0, -1.0);
-                float steering_input = map_float(pulse_steering, MIN_PULSE_US, MAX_PULSE_US, -1.0, 1.0);
+                AUTO_SERIAL.print("Throttle: " + String(espnowData.throttle, 2) + " ");
+                AUTO_SERIAL.println("Steering: " + String(espnowData.steering, 2));
                 
                 float steering_scale_factor = 1.0 - (STEERING_SENSITIVITY * abs(throttle_input));
                 float scaled_steering = steering_input * steering_scale_factor;
@@ -240,14 +269,41 @@ void loop() {
                 float desired_right_torque = curved_right * MAX_TORQUE;
                 float desired_left_torque = curved_left * MAX_TORQUE;
 
-                float right_torque_change = constrain(desired_right_torque - g_last_sent_right_torque, -MAX_TORQUE_CHANGE_PER_CYCLE, MAX_TORQUE_CHANGE_PER_CYCLE);
-                float left_torque_change = constrain(desired_left_torque - g_last_sent_left_torque, -MAX_TORQUE_CHANGE_PER_CYCLE, MAX_TORQUE_CHANGE_PER_CYCLE);
+                float right_delta = desired_right_torque - g_last_sent_right_torque;
+                float left_delta = desired_left_torque - g_last_sent_left_torque;
 
-                float final_right_torque = g_last_sent_right_torque + right_torque_change;
-                float final_left_torque = g_last_sent_left_torque + left_torque_change;
+                // Ramp only if ABS torque is increasing
+                float right_change;
+                if (fabsf(desired_right_torque) > fabsf(g_last_sent_right_torque)) {
+                    // Torque magnitude is increasing → apply ramp limit
+                    right_change = constrain(right_delta, -MAX_TORQUE_CHANGE_PER_CYCLE, MAX_TORQUE_CHANGE_PER_CYCLE);
+                } else {
+                    // Torque magnitude is decreasing or same → allow instant change
+                    right_change = right_delta;
+                }
+
+                float left_change;
+                if (fabsf(desired_left_torque) > fabsf(g_last_sent_left_torque)) {
+                    left_change = constrain(left_delta, -MAX_TORQUE_CHANGE_PER_CYCLE, MAX_TORQUE_CHANGE_PER_CYCLE);
+                } else {
+                    left_change = left_delta;
+                }
+
+                float final_right_torque = g_last_sent_right_torque + right_change;
+                float final_left_torque = g_last_sent_left_torque + left_change;
+
+                g_last_sent_right_torque = final_right_torque;
+                g_last_sent_left_torque = final_left_torque;
+
+
+                // float final_right_torque = g_last_sent_right_torque + right_torque_change;
+                // float final_left_torque = g_last_sent_left_torque + left_torque_change;
 
                 ODRIVE_SERIAL.print("c 0 " + String(final_right_torque, 2) + "\n");
                 ODRIVE_SERIAL.print("c 1 " + String(final_left_torque, 2) + "\n");
+                
+                // AUTO_SERIAL.print("c 0 " + String(final_right_torque, 2) + " ");
+                // AUTO_SERIAL.println("c 1 " + String(final_left_torque, 2) + "\n");
 
                 g_last_sent_right_torque = final_right_torque;
                 g_last_sent_left_torque = final_left_torque;
