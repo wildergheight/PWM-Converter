@@ -45,7 +45,7 @@ const float MAX_VELOCITY_RPS = 2.0;
 const bool ENABLE_LOW_VOLTAGE_CUTOFF = true;
 // IMPORTANT: Set this to a SAFE voltage for your battery pack.
 // For a 36V 10S Li-ion pack, 32V (3.2V/cell) is a safe cutoff point.
-const float LOW_VOLTAGE_CUTOFF = 32.0; 
+const float LOW_VOLTAGE_CUTOFF = 34.0; 
 const unsigned long VOLTAGE_CHECK_INTERVAL_MS = 2000; // Check voltage every 2 seconds
 
 // --- Failsafe and Timing ---
@@ -54,7 +54,7 @@ const unsigned long ESPNOW_FAILSAFE_TIMEOUT_MS = 500; // Fallback to brake after
 const unsigned long AUTO_FAILSAFE_TIMEOUT_MS = 500;   // Fallback to ESP-NOW after 500ms
 
 // --- Torque Ramp Rate ---
-const float TORQUE_RAMP_RATE = 1.0;  // [Nm/sec]
+const float TORQUE_RAMP_RATE = 2.0;  // [Nm/sec]
 const float MAX_TORQUE_CHANGE_PER_CYCLE = TORQUE_RAMP_RATE * (COMMAND_INTERVAL_MS / 1000.0);
 
 //================================================================================
@@ -194,6 +194,8 @@ void loop() {
 
     if (espnow_failsafe || espnowData.button_state) {
         desired_state = STATE_BRAKING;
+    } else if (ENABLE_LOW_VOLTAGE_CUTOFF && g_bus_voltage < LOW_VOLTAGE_CUTOFF && g_bus_voltage > 0.0) {
+        desired_state = STATE_LOW_VOLTAGE_CUTOFF;
     } else if (auto_override) {
         desired_state = STATE_VELOCITY_AUTO;
     } else {
@@ -235,8 +237,8 @@ void loop() {
             ODRIVE_SERIAL.println("v 0 0");
             ODRIVE_SERIAL.println("v 1 0");
 
-            // AUTO_SERIAL.print("v 0 0 ");
-            // AUTO_SERIAL.println("v 1 0");
+            AUTO_SERIAL.print("v 0 0 ");
+            AUTO_SERIAL.println("v 1 0");
                 
             break;
 
