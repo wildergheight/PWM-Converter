@@ -45,7 +45,7 @@ const float MAX_VELOCITY_RPS = 2.0;
 const bool ENABLE_LOW_VOLTAGE_CUTOFF = true;
 // IMPORTANT: Set this to a SAFE voltage for your battery pack.
 // For a 36V 10S Li-ion pack, 32V (3.2V/cell) is a safe cutoff point.
-const float LOW_VOLTAGE_CUTOFF = 34.0; 
+const float LOW_VOLTAGE_CUTOFF = 32.0; 
 const unsigned long VOLTAGE_CHECK_INTERVAL_MS = 2000; // Check voltage every 2 seconds
 
 // --- Failsafe and Timing ---
@@ -228,9 +228,19 @@ void loop() {
     // --- EXECUTE ACTION BASED ON STATE ---
     switch(g_control_state) {
         case STATE_LOW_VOLTAGE_CUTOFF:
-            // This is the highest priority state. Brakes are applied and held.
+            // This is the highest priority state. Brakes are applied and held, unless system is reset.
             ODRIVE_SERIAL.println("v 0 0");
             ODRIVE_SERIAL.println("v 1 0");
+            if (g_lvc_activated) {
+                while(1) { // Halt system
+                    ODRIVE_SERIAL.println("v 0 0");
+                    ODRIVE_SERIAL.println("v 1 0");
+
+                    AUTO_SERIAL.print("v 0 0 ");
+                    AUTO_SERIAL.println("v 1 0");
+                    delay(5);
+                }
+            }
             break;
 
         case STATE_BRAKING:
