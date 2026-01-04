@@ -70,6 +70,7 @@ typedef struct ControlData {
     float throttle;
     float steering;
     bool button_state;  // ADDED: 0 for off, 1 for on
+    bool auto_mode;
 } ControlData;
 
 ControlData espnowData;
@@ -196,7 +197,7 @@ void loop() {
         desired_state = STATE_BRAKING;
     } else if (ENABLE_LOW_VOLTAGE_CUTOFF && g_bus_voltage < LOW_VOLTAGE_CUTOFF && g_bus_voltage > 0.0) {
         desired_state = STATE_LOW_VOLTAGE_CUTOFF;
-    } else if (auto_override) {
+    } else if (auto_override || espnowData.auto_mode) {
         desired_state = STATE_VELOCITY_AUTO;
     } else {
         desired_state = STATE_TORQUE_ESPNOW;
@@ -254,6 +255,10 @@ void loop() {
 
         case STATE_VELOCITY_AUTO:
             {
+                if (espnowData.auto_mode){
+                    g_auto_left_norm = espnowData.throttle; //THROTTLE IS LEFT MOTOR IN ESPNOW AUTO MODE
+                    g_auto_right_norm = espnowData.steering; //STEERING IS RIGHT MOTOR IN ESPNOW AUTO MODE
+                }
                 float right_vel = g_auto_right_norm * MAX_VELOCITY_RPS;
                 float left_vel = g_auto_left_norm * MAX_VELOCITY_RPS;
                 ODRIVE_SERIAL.print("v 0 " + String(right_vel, 2) + "\n");
