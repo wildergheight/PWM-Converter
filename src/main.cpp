@@ -39,7 +39,7 @@ const float MAX_TORQUE = 30.0;
 const float STEERING_SENSITIVITY = 0.5;
 const float THROTTLE_EXPO = 2.3;
 
-const float MAX_VELOCITY_RPS = 2.0;
+const float MAX_VELOCITY_RPS = 3.0;
 
 // --- Battery & Low Voltage Cutoff ---
 const bool ENABLE_LOW_VOLTAGE_CUTOFF = true;
@@ -255,9 +255,11 @@ void loop() {
 
         case STATE_VELOCITY_AUTO:
             {
+                AUTO_SERIAL.print("Auto Right: " + String(espnowData.throttle, 2) + " ");
+                AUTO_SERIAL.println("Auto Left: " + String(espnowData.steering, 2));
                 if (espnowData.auto_mode){
-                    g_auto_left_norm = espnowData.throttle; //THROTTLE IS LEFT MOTOR IN ESPNOW AUTO MODE
-                    g_auto_right_norm = espnowData.steering; //STEERING IS RIGHT MOTOR IN ESPNOW AUTO MODE
+                    g_auto_right_norm = espnowData.throttle; //THROTTLE IS RIGHT MOTOR IN ESPNOW AUTO MODE
+                    g_auto_left_norm = espnowData.steering; //STEERING IS LEFT MOTOR IN ESPNOW AUTO MODE
                 }
                 float right_vel = g_auto_right_norm * MAX_VELOCITY_RPS;
                 float left_vel = g_auto_left_norm * MAX_VELOCITY_RPS;
