@@ -39,7 +39,9 @@ const float MAX_TORQUE = 30.0;
 const float STEERING_SENSITIVITY = 0.5;
 const float THROTTLE_EXPO = 2.3;
 
-const float MAX_VELOCITY_RPS = 3.0;
+const float MAX_VELOCITY_RPS = 4.0;
+// --- Velocity Tuning ---
+const float VEL_RAMP_RATE = 2.0; // Acceleration in turns/s^2 (lower = smoother)
 
 // --- Battery & Low Voltage Cutoff ---
 const bool ENABLE_LOW_VOLTAGE_CUTOFF = true;
@@ -207,12 +209,25 @@ void loop() {
     if (desired_state != g_control_state) {
         if ((desired_state == STATE_BRAKING || desired_state == STATE_VELOCITY_AUTO || desired_state == STATE_LOW_VOLTAGE_CUTOFF) && g_control_state == STATE_TORQUE_ESPNOW) {
             AUTO_SERIAL.println("STATE: Switching ODrive to VELOCITY_CONTROL");
-            ODRIVE_SERIAL.println("w 0.controller.config.control_mode 2");
-            ODRIVE_SERIAL.println("w 1.controller.config.control_mode 2");
+            ODRIVE_SERIAL.println("w axis0.controller.config.control_mode 2");
+            ODRIVE_SERIAL.println("w axis1.controller.config.control_mode 2");
+
+                // NEW: Set Input Mode to VEL_RAMP (2)
+            ODRIVE_SERIAL.println("w axis0.controller.config.input_mode 2");
+            ODRIVE_SERIAL.println("w axis1.controller.config.input_mode 2");
+
+            // NEW: Set the Acceleration (Ramp Rate)
+            ODRIVE_SERIAL.println("w axis0.controller.config.vel_ramp_rate " + String(VEL_RAMP_RATE));
+            ODRIVE_SERIAL.println("w axis1.controller.config.vel_ramp_rate " + String(VEL_RAMP_RATE));
+            
         } else if (desired_state == STATE_TORQUE_ESPNOW && g_control_state != STATE_TORQUE_ESPNOW) {
             AUTO_SERIAL.println("STATE: Switching ODrive to TORQUE_CONTROL");
-            ODRIVE_SERIAL.println("w 0.controller.config.control_mode 1");
-            ODRIVE_SERIAL.println("w 1.controller.config.control_mode 1");
+            ODRIVE_SERIAL.println("w axis0.controller.config.control_mode 1");
+            ODRIVE_SERIAL.println("w axis1.controller.config.control_mode 1");
+
+                // NEW: Set Input Mode to PASSTHROUGH (1)
+            ODRIVE_SERIAL.println("w axis0.controller.config.input_mode 1");
+            ODRIVE_SERIAL.println("w axis1.controller.config.input_mode 1");
         }
 
         // When LVC is triggered for the first time
@@ -263,8 +278,8 @@ void loop() {
                 }
                 float right_vel = g_auto_right_norm * MAX_VELOCITY_RPS;
                 float left_vel = g_auto_left_norm * MAX_VELOCITY_RPS;
-                ODRIVE_SERIAL.print("v 0 " + String(right_vel, 2) + "\n");
-                ODRIVE_SERIAL.print("v 1 " + String(left_vel, 2) + "\n");
+                ODRIVE_SERIAL.println("w axis0.controller.input_vel " + String(right_vel, 2));
+                ODRIVE_SERIAL.println("w axis1.controller.input_vel " + String(left_vel, 2));
             }
             break;
 
