@@ -39,9 +39,9 @@ const float MAX_TORQUE = 30.0;
 const float STEERING_SENSITIVITY = 0.5;
 const float THROTTLE_EXPO = 2.3;
 
-const float MAX_VELOCITY_RPS = 4.0;
+const float MAX_VELOCITY_RPS = 3.0;
 // --- Velocity Tuning ---
-const float VEL_RAMP_RATE = 2.0; // Acceleration in turns/s^2 (lower = smoother)
+const float VEL_RAMP_RATE = 1.0; // Acceleration in turns/s^2 (lower = smoother)
 
 // --- Battery & Low Voltage Cutoff ---
 const bool ENABLE_LOW_VOLTAGE_CUTOFF = true;
