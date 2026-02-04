@@ -19,6 +19,7 @@
 #include <math.h>
 #include <esp_now.h>
 #include <WiFi.h>
+#include <esp_wifi.h> // Required for esp_wifi_set_channel
 
 //================================================================================
 // Configuration
@@ -41,7 +42,16 @@ const float THROTTLE_EXPO = 2.3;
 
 const float MAX_VELOCITY_RPS = 3.0;
 // --- Velocity Tuning ---
-const float VEL_RAMP_RATE = 1.0; // Acceleration in turns/s^2 (lower = smoother)
+// const float VEL_RAMP_RATE = 1.0; // Acceleration in turns/s^2 (lower = smoother)
+// --- Velocity Tuning (ESP32-side Ramping) ---
+const float VEL_ACCEL_LIMIT = 1.2;   // Slow increase to prevent wheelies
+const float VEL_DECEL_LIMIT = 10.0;  // Fast decrease for safety/stopping
+const float VEL_STEER_SENSITIVITY = 1.0; // 1.0 = Steering is instant (unfiltered)
+
+// Global variables to track current ramped velocity
+float g_current_vel_left = 0.0;
+float g_current_vel_right = 0.0;
+
 
 // --- Battery & Low Voltage Cutoff ---
 const bool ENABLE_LOW_VOLTAGE_CUTOFF = true;
@@ -59,6 +69,11 @@ const unsigned long AUTO_FAILSAFE_TIMEOUT_MS = 500;   // Fallback to ESP-NOW aft
 const float TORQUE_RAMP_RATE = 2.0;  // [Nm/sec]
 const float MAX_TORQUE_CHANGE_PER_CYCLE = TORQUE_RAMP_RATE * (COMMAND_INTERVAL_MS / 1000.0);
 
+// --- Channel Scanning Variables ---
+int g_current_channel = 1;
+unsigned long g_last_scan_time = 0;
+const unsigned long SCAN_INTERVAL_MS = 150; // How long to stay on each channel while hunting
+const unsigned long SCAN_START_DELAY_MS = 2000;      // Wait 2 full seconds before hopping channels
 //================================================================================
 // Global Variables
 //================================================================================
@@ -102,6 +117,11 @@ unsigned long g_last_command_time = 0;
 void onDataRecv(const uint8_t * mac, const uint8_t *incomingData, int len) {
     memcpy(&espnowData, incomingData, sizeof(espnowData));
     g_last_espnow_command_time = millis();
+    
+    // Optional: Log that we found the remote
+    // if (g_control_state == STATE_BRAKING) {
+    //    AUTO_SERIAL.println("Remote Link Established on Channel " + String(g_current_channel));
+    // }
 }
 
 //================================================================================
@@ -158,6 +178,44 @@ void checkAutoSerial() {
     }
 }
 
+float applyAsymmetricRamp(float target, float current) {
+    float delta = target - current;
+    float max_change;
+
+    // Check if we are accelerating or decelerating
+    // (If target and current have the same sign and target is larger, we are accelerating)
+    if (abs(target) > abs(current)) {
+        max_change = VEL_ACCEL_LIMIT * (COMMAND_INTERVAL_MS / 1000.0);
+    } else {
+        // We are slowing down or crossing zero - use the fast limit
+        max_change = VEL_DECEL_LIMIT * (COMMAND_INTERVAL_MS / 1000.0);
+    }
+
+    return current + constrain(delta, -max_change, max_change);
+}
+
+void handleChannelScanning() {
+    unsigned long timeSinceLastPacket = millis() - g_last_espnow_command_time;
+
+    // 1. If we've heard from the remote recently, STAY on this channel.
+    if (timeSinceLastPacket < SCAN_START_DELAY_MS) {
+        return; 
+    }
+
+    // 2. If we've been silent for more than 2 seconds, start hunting.
+    if (millis() - g_last_scan_time > SCAN_INTERVAL_MS) {
+        g_last_scan_time = millis();
+        
+        g_current_channel++;
+        if (g_current_channel > 13) g_current_channel = 1;
+
+        esp_wifi_set_channel(g_current_channel, WIFI_SECOND_CHAN_NONE);
+        
+        AUTO_SERIAL.print("Link Lost. Hunting on Channel ");
+        AUTO_SERIAL.println(g_current_channel);
+    }
+}
+
 //================================================================================
 // Main Program
 //================================================================================
@@ -169,6 +227,7 @@ void setup() {
     
     // Set device as a Wi-Fi Station
     WiFi.mode(WIFI_STA);
+    WiFi.setSleep(false);
     AUTO_SERIAL.print("My MAC Address: ");
     AUTO_SERIAL.println(WiFi.macAddress());
 
@@ -183,6 +242,7 @@ void setup() {
 }
 
 void loop() {
+    handleChannelScanning(); // Start hunting if the remote is gone
     checkAutoSerial();
     checkODriveVoltage(); // Ask for and parse ODrive voltage
 
@@ -213,12 +273,12 @@ void loop() {
             ODRIVE_SERIAL.println("w axis1.controller.config.control_mode 2");
 
                 // NEW: Set Input Mode to VEL_RAMP (2)
-            ODRIVE_SERIAL.println("w axis0.controller.config.input_mode 2");
-            ODRIVE_SERIAL.println("w axis1.controller.config.input_mode 2");
+            ODRIVE_SERIAL.println("w axis0.controller.config.input_mode 1");
+            ODRIVE_SERIAL.println("w axis1.controller.config.input_mode 1");
 
-            // NEW: Set the Acceleration (Ramp Rate)
-            ODRIVE_SERIAL.println("w axis0.controller.config.vel_ramp_rate " + String(VEL_RAMP_RATE));
-            ODRIVE_SERIAL.println("w axis1.controller.config.vel_ramp_rate " + String(VEL_RAMP_RATE));
+            // // NEW: Set the Acceleration (Ramp Rate)
+            // ODRIVE_SERIAL.println("w axis0.controller.config.vel_ramp_rate " + String(VEL_RAMP_RATE));
+            // ODRIVE_SERIAL.println("w axis1.controller.config.vel_ramp_rate " + String(VEL_RAMP_RATE));
             
         } else if (desired_state == STATE_TORQUE_ESPNOW && g_control_state != STATE_TORQUE_ESPNOW) {
             AUTO_SERIAL.println("STATE: Switching ODrive to TORQUE_CONTROL");
@@ -278,8 +338,14 @@ void loop() {
                 }
                 float right_vel = g_auto_right_norm * MAX_VELOCITY_RPS;
                 float left_vel = g_auto_left_norm * MAX_VELOCITY_RPS;
-                ODRIVE_SERIAL.println("w axis0.controller.input_vel " + String(right_vel, 2));
-                ODRIVE_SERIAL.println("w axis1.controller.input_vel " + String(left_vel, 2));
+
+                // Apply the asymmetric ramp
+                g_current_vel_right = applyAsymmetricRamp(right_vel, g_current_vel_right);
+                g_current_vel_left = applyAsymmetricRamp(left_vel, g_current_vel_left);
+
+
+                ODRIVE_SERIAL.println("w axis0.controller.input_vel " + String(g_current_vel_right, 2));
+                ODRIVE_SERIAL.println("w axis1.controller.input_vel " + String(g_current_vel_left, 2));
             }
             break;
 
