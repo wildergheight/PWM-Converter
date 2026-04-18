@@ -31,6 +31,10 @@ const int ODRIVE_RX_PIN = 16;
 const int ODRIVE_TX_PIN = 17;
 const long ODRIVE_BAUD_RATE = 115200;
 
+const int RIGHT_LED = 18; // Optional: GPIO for a status LED indicating right motor activity
+const int LEFT_LED = 19;  // Optional: GPIO for a status LED indicating left motor activity
+const int BATT_LED = 21;  // Optional: GPIO for a status LED indicating low battery (LVC) state
+
 // --- Automation Serial Port (Main USB) ---
 #define AUTO_SERIAL Serial
 const long AUTO_BAUD_RATE = 115200;
@@ -224,7 +228,14 @@ void setup() {
     ODRIVE_SERIAL.begin(ODRIVE_BAUD_RATE, SERIAL_8N1, ODRIVE_RX_PIN, ODRIVE_TX_PIN);
     
     AUTO_SERIAL.println("ESP32 ODrive Bridge v9.0 (ESP-NOW) Ready.");
+    pinMode(RIGHT_LED,OUTPUT);
+    pinMode(LEFT_LED,OUTPUT);
+    pinMode(BATT_LED,OUTPUT);
     
+    digitalWrite (RIGHT_LED, HIGH);
+    digitalWrite (LEFT_LED, HIGH);
+    digitalWrite (BATT_LED, HIGH);
+
     // Set device as a Wi-Fi Station
     WiFi.mode(WIFI_STA);
     WiFi.setSleep(false);
@@ -239,6 +250,11 @@ void setup() {
     
     // Register the receive callback
     esp_now_register_recv_cb(onDataRecv);
+
+    // Cart is Ready
+    digitalWrite (RIGHT_LED, LOW);
+    digitalWrite (LEFT_LED, LOW);
+    digitalWrite (BATT_LED, LOW);
 }
 
 void loop() {
@@ -295,6 +311,7 @@ void loop() {
             g_lvc_activated = true; // Latch the LVC state
             AUTO_SERIAL.println("!!! LOW VOLTAGE CUTOFF ACTIVATED !!!");
             AUTO_SERIAL.println("Voltage: " + String(g_bus_voltage) + "V. System halted.");
+            digitalWrite (BATT_LED, HIGH);
         }
 
         g_control_state = desired_state;
