@@ -31,9 +31,21 @@ const int ODRIVE_RX_PIN = 16;
 const int ODRIVE_TX_PIN = 17;
 const long ODRIVE_BAUD_RATE = 115200;
 
+// Optional: Status LEDs (for debugging and feedback)
+
 const int RIGHT_LED = 18; // Optional: GPIO for a status LED indicating right motor activity
 const int LEFT_LED = 19;  // Optional: GPIO for a status LED indicating left motor activity
 const int BATT_LED = 21;  // Optional: GPIO for a status LED indicating low battery (LVC) state
+
+// --- ODrive Query State Machine ---
+enum OdriveQueryType { QUERY_VOLTAGE, QUERY_AXIS0_ERROR, QUERY_AXIS1_ERROR };
+OdriveQueryType g_pending_query = QUERY_VOLTAGE;   // What to send NEXT
+OdriveQueryType g_awaiting_reply = QUERY_VOLTAGE;  // What we're waiting a reply FOR
+unsigned long g_last_query_time = 0;
+const unsigned long QUERY_INTERVAL_MS = 100;
+
+bool g_axis0_fault = false;
+bool g_axis1_fault = false;
 
 // --- Automation Serial Port (Main USB) ---
 #define AUTO_SERIAL Serial
@@ -61,8 +73,9 @@ float g_current_vel_right = 0.0;
 const bool ENABLE_LOW_VOLTAGE_CUTOFF = true;
 // IMPORTANT: Set this to a SAFE voltage for your battery pack.
 // For a 36V 10S Li-ion pack, 32V (3.2V/cell) is a safe cutoff point.
-const float LOW_VOLTAGE_CUTOFF = 32.0; 
 const unsigned long VOLTAGE_CHECK_INTERVAL_MS = 2000; // Check voltage every 2 seconds
+const float LOW_VOLTAGE_CUTOFF = 32.0;
+const int LVC_CONSECUTIVE_READINGS = 5; // Must see low voltage this many times in a row to trigger
 
 // --- Failsafe and Timing ---
 const unsigned long COMMAND_INTERVAL_MS = 20;
@@ -111,6 +124,7 @@ float g_last_sent_left_torque = 0.0;
 float g_bus_voltage = 0.0; // Stores the last read voltage from ODrive
 unsigned long g_last_voltage_check_time = 0;
 bool g_lvc_activated = false; // Latches the LVC state once triggered
+int g_lvc_consecutive_count = 0; // Tracks consecutive low voltage readings
 
 
 unsigned long g_last_command_time = 0;
@@ -135,21 +149,74 @@ float map_float(float x, float in_min, float in_max, float out_min, float out_ma
     return (x - in_min) * (out_max - out_min) / (in_max - in_min) + out_min;
 }
 
-void checkODriveVoltage() {
-    // Periodically ask the ODrive for its voltage
-    if (ENABLE_LOW_VOLTAGE_CUTOFF && millis() - g_last_voltage_check_time > VOLTAGE_CHECK_INTERVAL_MS) {
-        ODRIVE_SERIAL.println("r vbus_voltage");
-        g_last_voltage_check_time = millis();
+void checkODriveStatus() {
+    // --- Send the next query ---
+    if (millis() - g_last_query_time > QUERY_INTERVAL_MS) {
+        g_last_query_time = millis();
+
+        switch (g_pending_query) {
+            case QUERY_VOLTAGE:
+                ODRIVE_SERIAL.println("r vbus_voltage");
+                g_awaiting_reply = QUERY_VOLTAGE;
+                g_pending_query  = QUERY_AXIS0_ERROR;
+                break;
+
+            case QUERY_AXIS0_ERROR:
+                ODRIVE_SERIAL.println("r axis0.error");
+                g_awaiting_reply = QUERY_AXIS0_ERROR;
+                g_pending_query  = QUERY_AXIS1_ERROR;
+                break;
+
+            case QUERY_AXIS1_ERROR:
+                ODRIVE_SERIAL.println("r axis1.error");
+                g_awaiting_reply = QUERY_AXIS1_ERROR;
+                g_pending_query  = QUERY_VOLTAGE;
+                break;
+        }
     }
 
-    // Check if the ODrive has sent a reply
+    // --- Parse any available ODrive response ---
     while (ODRIVE_SERIAL.available()) {
         String response = ODRIVE_SERIAL.readStringUntil('\n');
-        float parsed_voltage = response.toFloat();
-        // Basic validation to filter out noise or parsing errors
-        if (parsed_voltage > 10.0) { 
-            g_bus_voltage = parsed_voltage;
-            AUTO_SERIAL.println("VBUS: " + String(g_bus_voltage) + "V");
+        response.trim();
+        if (response.length() == 0) continue;
+
+        switch (g_awaiting_reply) {
+            case QUERY_VOLTAGE: {
+                float parsed_voltage = response.toFloat();
+                if (parsed_voltage > 10.0) {
+                    g_bus_voltage = parsed_voltage;
+                    AUTO_SERIAL.println("VBUS: " + String(g_bus_voltage, 1) + "V");
+
+                    if (ENABLE_LOW_VOLTAGE_CUTOFF && g_bus_voltage < LOW_VOLTAGE_CUTOFF) {
+                        g_lvc_consecutive_count++;
+                        AUTO_SERIAL.println("LVC Warning: " + String(g_lvc_consecutive_count) + "/" + String(LVC_CONSECUTIVE_READINGS));
+                    } else {
+                        g_lvc_consecutive_count = 0; // Reset on any healthy reading
+                    }
+                }
+                break;
+            }
+
+            case QUERY_AXIS0_ERROR: {
+                int error_code = strtol(response.c_str(), nullptr, 0); // handles 0x... and decimal
+                g_axis0_fault = (error_code != 0);
+                digitalWrite(RIGHT_LED, g_axis0_fault ? HIGH : LOW);
+                if (g_axis0_fault) {
+                    AUTO_SERIAL.println("FAULT axis0: 0x" + String(error_code, HEX));
+                }
+                break;
+            }
+
+            case QUERY_AXIS1_ERROR: {
+                int error_code = strtol(response.c_str(), nullptr, 0);
+                g_axis1_fault = (error_code != 0);
+                digitalWrite(LEFT_LED, g_axis1_fault ? HIGH : LOW);
+                if (g_axis1_fault) {
+                    AUTO_SERIAL.println("FAULT axis1: 0x" + String(error_code, HEX));
+                }
+                break;
+            }
         }
     }
 }
@@ -260,7 +327,7 @@ void setup() {
 void loop() {
     handleChannelScanning(); // Start hunting if the remote is gone
     checkAutoSerial();
-    checkODriveVoltage(); // Ask for and parse ODrive voltage
+    checkODriveStatus(); // Ask for and parse ODrive status
 
     if (millis() - g_last_command_time < COMMAND_INTERVAL_MS) return;
     g_last_command_time = millis();
@@ -273,7 +340,7 @@ void loop() {
 
     if (espnow_failsafe || espnowData.button_state) {
         desired_state = STATE_BRAKING;
-    } else if (ENABLE_LOW_VOLTAGE_CUTOFF && g_bus_voltage < LOW_VOLTAGE_CUTOFF && g_bus_voltage > 0.0) {
+    } else if (ENABLE_LOW_VOLTAGE_CUTOFF && g_lvc_consecutive_count >= LVC_CONSECUTIVE_READINGS) {
         desired_state = STATE_LOW_VOLTAGE_CUTOFF;
     } else if (auto_override || espnowData.auto_mode) {
         desired_state = STATE_VELOCITY_AUTO;
