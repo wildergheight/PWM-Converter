@@ -21,6 +21,12 @@
 #include <WiFi.h>
 #include <esp_wifi.h> // Required for esp_wifi_set_channel
 
+// --- Tuning Mode ---
+// Set to true when using odrivetool/Python scripts to tune PID gains.
+// Disables ALL ESP32 writes to the ODrive so external tools have exclusive control.
+// MUST be false for normal cart operation.
+#define TUNING_MODE false
+
 //================================================================================
 // Configuration
 //================================================================================
@@ -327,7 +333,9 @@ void setup() {
 void loop() {
     handleChannelScanning(); // Start hunting if the remote is gone
     checkAutoSerial();
-    checkODriveStatus(); // Ask for and parse ODrive status
+    if (!TUNING_MODE) {
+        checkODriveStatus();    // Ask for and parse ODrive status
+    }
 
     if (millis() - g_last_command_time < COMMAND_INTERVAL_MS) return;
     g_last_command_time = millis();
@@ -349,149 +357,153 @@ void loop() {
     }
 
     // --- HANDLE ODRIVE MODE TRANSITIONS ---
-    if (desired_state != g_control_state) {
-        if ((desired_state == STATE_BRAKING || desired_state == STATE_VELOCITY_AUTO || desired_state == STATE_LOW_VOLTAGE_CUTOFF) && g_control_state == STATE_TORQUE_ESPNOW) {
-            AUTO_SERIAL.println("STATE: Switching ODrive to VELOCITY_CONTROL");
-            ODRIVE_SERIAL.println("w axis0.controller.config.control_mode 2");
-            ODRIVE_SERIAL.println("w axis1.controller.config.control_mode 2");
+    if (!TUNING_MODE){
+        if (desired_state != g_control_state) {
+            if ((desired_state == STATE_BRAKING || desired_state == STATE_VELOCITY_AUTO || desired_state == STATE_LOW_VOLTAGE_CUTOFF) && g_control_state == STATE_TORQUE_ESPNOW) {
+                AUTO_SERIAL.println("STATE: Switching ODrive to VELOCITY_CONTROL");
+                ODRIVE_SERIAL.println("w axis0.controller.config.control_mode 2");
+                ODRIVE_SERIAL.println("w axis1.controller.config.control_mode 2");
 
-                // NEW: Set Input Mode to VEL_RAMP (2)
-            ODRIVE_SERIAL.println("w axis0.controller.config.input_mode 1");
-            ODRIVE_SERIAL.println("w axis1.controller.config.input_mode 1");
+                    // NEW: Set Input Mode to VEL_RAMP (2)
+                ODRIVE_SERIAL.println("w axis0.controller.config.input_mode 1");
+                ODRIVE_SERIAL.println("w axis1.controller.config.input_mode 1");
 
-            // // NEW: Set the Acceleration (Ramp Rate)
-            // ODRIVE_SERIAL.println("w axis0.controller.config.vel_ramp_rate " + String(VEL_RAMP_RATE));
-            // ODRIVE_SERIAL.println("w axis1.controller.config.vel_ramp_rate " + String(VEL_RAMP_RATE));
-            
-        } else if (desired_state == STATE_TORQUE_ESPNOW && g_control_state != STATE_TORQUE_ESPNOW) {
-            AUTO_SERIAL.println("STATE: Switching ODrive to TORQUE_CONTROL");
-            ODRIVE_SERIAL.println("w axis0.controller.config.control_mode 1");
-            ODRIVE_SERIAL.println("w axis1.controller.config.control_mode 1");
+                // // NEW: Set the Acceleration (Ramp Rate)
+                // ODRIVE_SERIAL.println("w axis0.controller.config.vel_ramp_rate " + String(VEL_RAMP_RATE));
+                // ODRIVE_SERIAL.println("w axis1.controller.config.vel_ramp_rate " + String(VEL_RAMP_RATE));
+                
+            } else if (desired_state == STATE_TORQUE_ESPNOW && g_control_state != STATE_TORQUE_ESPNOW) {
+                AUTO_SERIAL.println("STATE: Switching ODrive to TORQUE_CONTROL");
+                ODRIVE_SERIAL.println("w axis0.controller.config.control_mode 1");
+                ODRIVE_SERIAL.println("w axis1.controller.config.control_mode 1");
 
-                // NEW: Set Input Mode to PASSTHROUGH (1)
-            ODRIVE_SERIAL.println("w axis0.controller.config.input_mode 1");
-            ODRIVE_SERIAL.println("w axis1.controller.config.input_mode 1");
-        }
+                    // NEW: Set Input Mode to PASSTHROUGH (1)
+                ODRIVE_SERIAL.println("w axis0.controller.config.input_mode 1");
+                ODRIVE_SERIAL.println("w axis1.controller.config.input_mode 1");
+            }
 
-        // When LVC is triggered for the first time
-        if(desired_state == STATE_LOW_VOLTAGE_CUTOFF && !g_lvc_activated){
-            g_lvc_activated = true; // Latch the LVC state
-            AUTO_SERIAL.println("!!! LOW VOLTAGE CUTOFF ACTIVATED !!!");
-            AUTO_SERIAL.println("Voltage: " + String(g_bus_voltage) + "V. System halted.");
-            digitalWrite (BATT_LED, HIGH);
-        }
-
-        g_control_state = desired_state;
+            // When LVC is triggered for the first time
+            if(desired_state == STATE_LOW_VOLTAGE_CUTOFF && !g_lvc_activated){
+                g_lvc_activated = true; // Latch the LVC state
+                AUTO_SERIAL.println("!!! LOW VOLTAGE CUTOFF ACTIVATED !!!");
+                AUTO_SERIAL.println("Voltage: " + String(g_bus_voltage) + "V. System halted.");
+                digitalWrite (BATT_LED, HIGH);
+            }
+    }
         delay(5);
     }
+    g_control_state = desired_state;
+
 
     // --- EXECUTE ACTION BASED ON STATE ---
-    switch(g_control_state) {
-        case STATE_LOW_VOLTAGE_CUTOFF:
-            // This is the highest priority state. Brakes are applied and held, unless system is reset.
-            ODRIVE_SERIAL.println("v 0 0");
-            ODRIVE_SERIAL.println("v 1 0");
-            if (g_lvc_activated) {
-                while(1) { // Halt system
-                    ODRIVE_SERIAL.println("v 0 0");
-                    ODRIVE_SERIAL.println("v 1 0");
+    if (!TUNING_MODE) {
+        switch(g_control_state) {
+            case STATE_LOW_VOLTAGE_CUTOFF:
+                // This is the highest priority state. Brakes are applied and held, unless system is reset.
+                ODRIVE_SERIAL.println("v 0 0");
+                ODRIVE_SERIAL.println("v 1 0");
+                if (g_lvc_activated) {
+                    while(1) { // Halt system
+                        ODRIVE_SERIAL.println("v 0 0");
+                        ODRIVE_SERIAL.println("v 1 0");
 
-                    AUTO_SERIAL.print("v 0 0 ");
-                    AUTO_SERIAL.println("v 1 0");
-                    delay(5);
+                        AUTO_SERIAL.print("v 0 0 ");
+                        AUTO_SERIAL.println("v 1 0");
+                        delay(5);
+                    }
                 }
-            }
-            break;
+                break;
 
-        case STATE_BRAKING:
-            ODRIVE_SERIAL.println("v 0 0");
-            ODRIVE_SERIAL.println("v 1 0");
+            case STATE_BRAKING:
+                ODRIVE_SERIAL.println("v 0 0");
+                ODRIVE_SERIAL.println("v 1 0");
 
-            AUTO_SERIAL.print("v 0 0 ");
-            AUTO_SERIAL.println("v 1 0");
-                
-            break;
+                AUTO_SERIAL.print("v 0 0 ");
+                AUTO_SERIAL.println("v 1 0");
+                    
+                break;
 
-        case STATE_VELOCITY_AUTO:
-            {
-                AUTO_SERIAL.print("Auto Right: " + String(espnowData.throttle, 2) + " ");
-                AUTO_SERIAL.println("Auto Left: " + String(espnowData.steering, 2));
-                if (espnowData.auto_mode){
-                    g_auto_right_norm = espnowData.throttle; //THROTTLE IS RIGHT MOTOR IN ESPNOW AUTO MODE
-                    g_auto_left_norm = espnowData.steering; //STEERING IS LEFT MOTOR IN ESPNOW AUTO MODE
+            case STATE_VELOCITY_AUTO:
+                {
+                    AUTO_SERIAL.print("Auto Right: " + String(espnowData.throttle, 2) + " ");
+                    AUTO_SERIAL.println("Auto Left: " + String(espnowData.steering, 2));
+                    if (espnowData.auto_mode){
+                        g_auto_right_norm = espnowData.throttle; //THROTTLE IS RIGHT MOTOR IN ESPNOW AUTO MODE
+                        g_auto_left_norm = espnowData.steering; //STEERING IS LEFT MOTOR IN ESPNOW AUTO MODE
+                    }
+                    float right_vel = g_auto_right_norm * MAX_VELOCITY_RPS;
+                    float left_vel = g_auto_left_norm * MAX_VELOCITY_RPS;
+
+                    // Apply the asymmetric ramp
+                    g_current_vel_right = applyAsymmetricRamp(right_vel, g_current_vel_right);
+                    g_current_vel_left = applyAsymmetricRamp(left_vel, g_current_vel_left);
+
+
+                    ODRIVE_SERIAL.println("w axis0.controller.input_vel " + String(g_current_vel_right, 2));
+                    ODRIVE_SERIAL.println("w axis1.controller.input_vel " + String(g_current_vel_left, 2));
                 }
-                float right_vel = g_auto_right_norm * MAX_VELOCITY_RPS;
-                float left_vel = g_auto_left_norm * MAX_VELOCITY_RPS;
+                break;
 
-                // Apply the asymmetric ramp
-                g_current_vel_right = applyAsymmetricRamp(right_vel, g_current_vel_right);
-                g_current_vel_left = applyAsymmetricRamp(left_vel, g_current_vel_left);
+            case STATE_TORQUE_ESPNOW:
+                {
+                    float throttle_input = espnowData.steering;
+                    float steering_input = espnowData.throttle;
+
+                    AUTO_SERIAL.print("Throttle: " + String(espnowData.throttle, 2) + " ");
+                    AUTO_SERIAL.println("Steering: " + String(espnowData.steering, 2));
+                    
+                    float steering_scale_factor = 1.0 - (STEERING_SENSITIVITY * abs(throttle_input));
+                    float scaled_steering = steering_input * steering_scale_factor;
+
+                    float right_norm = constrain(throttle_input - scaled_steering, -1.0, 1.0);
+                    float left_norm = constrain(throttle_input + scaled_steering, -1.0, 1.0);
+
+                    float curved_right = copysignf(powf(fabsf(right_norm), THROTTLE_EXPO), right_norm);
+                    float curved_left = copysignf(powf(fabsf(left_norm), THROTTLE_EXPO), left_norm);
+
+                    float desired_right_torque = curved_right * MAX_TORQUE;
+                    float desired_left_torque = curved_left * MAX_TORQUE;
+
+                    float right_delta = desired_right_torque - g_last_sent_right_torque;
+                    float left_delta = desired_left_torque - g_last_sent_left_torque;
+
+                    // Ramp only if ABS torque is increasing
+                    float right_change;
+                    if (fabsf(desired_right_torque) > fabsf(g_last_sent_right_torque)) {
+                        // Torque magnitude is increasing → apply ramp limit
+                        right_change = constrain(right_delta, -MAX_TORQUE_CHANGE_PER_CYCLE, MAX_TORQUE_CHANGE_PER_CYCLE);
+                    } else {
+                        // Torque magnitude is decreasing or same → allow instant change
+                        right_change = right_delta;
+                    }
+
+                    float left_change;
+                    if (fabsf(desired_left_torque) > fabsf(g_last_sent_left_torque)) {
+                        left_change = constrain(left_delta, -MAX_TORQUE_CHANGE_PER_CYCLE, MAX_TORQUE_CHANGE_PER_CYCLE);
+                    } else {
+                        left_change = left_delta;
+                    }
+
+                    float final_right_torque = g_last_sent_right_torque + right_change;
+                    float final_left_torque = g_last_sent_left_torque + left_change;
+
+                    g_last_sent_right_torque = final_right_torque;
+                    g_last_sent_left_torque = final_left_torque;
 
 
-                ODRIVE_SERIAL.println("w axis0.controller.input_vel " + String(g_current_vel_right, 2));
-                ODRIVE_SERIAL.println("w axis1.controller.input_vel " + String(g_current_vel_left, 2));
-            }
-            break;
+                    // float final_right_torque = g_last_sent_right_torque + right_torque_change;
+                    // float final_left_torque = g_last_sent_left_torque + left_torque_change;
 
-        case STATE_TORQUE_ESPNOW:
-            {
-                float throttle_input = espnowData.steering;
-                float steering_input = espnowData.throttle;
+                    ODRIVE_SERIAL.print("c 0 " + String(final_right_torque, 2) + "\n");
+                    ODRIVE_SERIAL.print("c 1 " + String(final_left_torque, 2) + "\n");
+                    
+                    // AUTO_SERIAL.print("c 0 " + String(final_right_torque, 2) + " ");
+                    // AUTO_SERIAL.println("c 1 " + String(final_left_torque, 2) + "\n");
 
-                AUTO_SERIAL.print("Throttle: " + String(espnowData.throttle, 2) + " ");
-                AUTO_SERIAL.println("Steering: " + String(espnowData.steering, 2));
-                
-                float steering_scale_factor = 1.0 - (STEERING_SENSITIVITY * abs(throttle_input));
-                float scaled_steering = steering_input * steering_scale_factor;
-
-                float right_norm = constrain(throttle_input - scaled_steering, -1.0, 1.0);
-                float left_norm = constrain(throttle_input + scaled_steering, -1.0, 1.0);
-
-                float curved_right = copysignf(powf(fabsf(right_norm), THROTTLE_EXPO), right_norm);
-                float curved_left = copysignf(powf(fabsf(left_norm), THROTTLE_EXPO), left_norm);
-
-                float desired_right_torque = curved_right * MAX_TORQUE;
-                float desired_left_torque = curved_left * MAX_TORQUE;
-
-                float right_delta = desired_right_torque - g_last_sent_right_torque;
-                float left_delta = desired_left_torque - g_last_sent_left_torque;
-
-                // Ramp only if ABS torque is increasing
-                float right_change;
-                if (fabsf(desired_right_torque) > fabsf(g_last_sent_right_torque)) {
-                    // Torque magnitude is increasing → apply ramp limit
-                    right_change = constrain(right_delta, -MAX_TORQUE_CHANGE_PER_CYCLE, MAX_TORQUE_CHANGE_PER_CYCLE);
-                } else {
-                    // Torque magnitude is decreasing or same → allow instant change
-                    right_change = right_delta;
+                    g_last_sent_right_torque = final_right_torque;
+                    g_last_sent_left_torque = final_left_torque;
                 }
-
-                float left_change;
-                if (fabsf(desired_left_torque) > fabsf(g_last_sent_left_torque)) {
-                    left_change = constrain(left_delta, -MAX_TORQUE_CHANGE_PER_CYCLE, MAX_TORQUE_CHANGE_PER_CYCLE);
-                } else {
-                    left_change = left_delta;
-                }
-
-                float final_right_torque = g_last_sent_right_torque + right_change;
-                float final_left_torque = g_last_sent_left_torque + left_change;
-
-                g_last_sent_right_torque = final_right_torque;
-                g_last_sent_left_torque = final_left_torque;
-
-
-                // float final_right_torque = g_last_sent_right_torque + right_torque_change;
-                // float final_left_torque = g_last_sent_left_torque + left_torque_change;
-
-                ODRIVE_SERIAL.print("c 0 " + String(final_right_torque, 2) + "\n");
-                ODRIVE_SERIAL.print("c 1 " + String(final_left_torque, 2) + "\n");
-                
-                // AUTO_SERIAL.print("c 0 " + String(final_right_torque, 2) + " ");
-                // AUTO_SERIAL.println("c 1 " + String(final_left_torque, 2) + "\n");
-
-                g_last_sent_right_torque = final_right_torque;
-                g_last_sent_left_torque = final_left_torque;
-            }
-            break;
+                break;
+        }
     }
 }
