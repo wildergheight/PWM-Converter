@@ -125,6 +125,9 @@ void executeControlState() {
             // bearing is available here but not used until Phase B tuning.
             float v_forward = distController.update(dist);
 
+            // No reverse in auto mode - if the cart is too close, stop rather than back up.
+            v_forward = max(0.0f, v_forward);
+
             // Both wheels get the same forward velocity (no steering yet).
             float target_vel = v_forward;
             g_current_vel_right = applyAsymmetricRamp(target_vel, g_current_vel_right);
@@ -139,7 +142,7 @@ void executeControlState() {
             AUTO_SERIAL.print("deg | v_fwd=");
             AUTO_SERIAL.print(v_forward, 3);
             AUTO_SERIAL.print(" | v_r=");
-            AUTO_SERIAL.print(g_current_vel_right, 3);
+            AUTO_SERIAL.print(-g_current_vel_right, 3);   // ← negated
             AUTO_SERIAL.print(" | v_l=");
             AUTO_SERIAL.print(g_current_vel_left, 3);
             AUTO_SERIAL.print(" | err=");
@@ -148,7 +151,7 @@ void executeControlState() {
             AUTO_SERIAL.println(distController.getIntegral(), 3);
 #else
     #if !TUNING_MODE
-            sendOdriveVelocity(g_current_vel_right, g_current_vel_left);
+            sendOdriveVelocity(-g_current_vel_right, g_current_vel_left);    // ← negated
     #endif
 #endif
             break;

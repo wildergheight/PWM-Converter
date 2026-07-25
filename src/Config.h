@@ -19,7 +19,7 @@
 //         send them to the ODrive. Use this to validate PID behaviour while
 //         pushing the cart by hand.
 // false = live operation, commands go to ODrive as normal.
-#define AUTO_DRY_RUN true
+#define AUTO_DRY_RUN false
 
 // --- ODrive Serial Port Configuration ---
 #define ODRIVE_SERIAL Serial2
