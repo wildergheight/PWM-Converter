@@ -7,8 +7,8 @@
 
 static void onDataRecv(const uint8_t *mac, const uint8_t *incomingData, int len) {
     // Route by packet size:
-    //   sizeof(ControlData) = 12  → remote control from T-Beam
-    //   sizeof(UWBData)     =  9  → ranging data from Anchor B
+    //   sizeof(UWBData)     = 10  → Anchor B  (packed struct)
+    //   sizeof(ControlData) = 12  → T-Beam remote
     if (len == sizeof(UWBData)) {
         memcpy(&g_uwb_data, incomingData, sizeof(UWBData));
         g_last_uwb_data_time = millis();
@@ -16,7 +16,6 @@ static void onDataRecv(const uint8_t *mac, const uint8_t *incomingData, int len)
         memcpy(&espnowData, incomingData, sizeof(espnowData));
         g_last_espnow_command_time = millis();
     }
-    // Unknown packet length: silently ignore
 }
 
 void initEspNow() {
@@ -29,13 +28,11 @@ void initEspNow() {
         AUTO_SERIAL.println("Error initializing ESP-NOW");
         return;
     }
-
     esp_now_register_recv_cb(onDataRecv);
 }
 
 void handleChannelScanning() {
     unsigned long timeSinceLastPacket = millis() - g_last_espnow_command_time;
-
     if (timeSinceLastPacket < SCAN_START_DELAY_MS) return;
 
     if (millis() - g_last_scan_time > SCAN_INTERVAL_MS) {
