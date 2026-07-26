@@ -70,3 +70,130 @@ void loop() {
 
     executeControlState();
 }
+
+
+// /*
+//  * Wheel Trim Calibration - Standalone Test
+//  * Runs both ODrive axes at equal commanded velocity with adjustable trim.
+//  * Flash this temporarily, calibrate, then port TRIM_LEFT/TRIM_RIGHT
+//  * values into main.cpp and reflash that.
+//  *
+//  * Serial commands (115200 baud):
+//  *   g          - go (start motors)
+//  *   s          - stop (brake)
+//  *   +  / -     - nudge RIGHT trim up/down by 0.01
+//  *   [  / ]     - nudge LEFT trim up/down by 0.01
+//  *   v0.5       - set base test velocity (turns/sec), e.g. "v0.5"
+//  *   p          - print current trim + velocity values
+//  */
+
+// /*
+//  * Wheel Trim Calibration - Standalone Test (with dead-man's-switch failsafe)
+//  *
+//  * Serial commands (115200 baud):
+//  *   HOLD 'g'   - run motors (must keep arriving repeatedly - hold the key down)
+//  *   release/no data for HEARTBEAT_TIMEOUT_MS - auto-stop
+//  *   +  / -     - nudge RIGHT trim up/down by 0.01
+//  *   [  / ]     - nudge LEFT trim up/down by 0.01
+//  *   v0.5       - set base test velocity (turns/sec), e.g. "v0.5"
+//  *   p          - print current trim + velocity values
+//  */
+
+// #include <Arduino.h>
+
+// #define ODRIVE_SERIAL Serial2
+// const int ODRIVE_RX_PIN = 16;
+// const int ODRIVE_TX_PIN = 17;
+// const long ODRIVE_BAUD_RATE = 115200;
+
+// float TRIM_RIGHT = 1.00;
+// float TRIM_LEFT  = 1.00;
+// const float DIR_RIGHT = -1.0;  // physically reversed
+// const float DIR_LEFT  =  1.0;
+// float BASE_VEL   = 0.8;   // turns/sec
+
+// const unsigned long CMD_INTERVAL_MS = 20;
+// unsigned long g_last_cmd_time = 0;
+
+// // --- Dead-man's-switch failsafe ---
+// const unsigned long HEARTBEAT_TIMEOUT_MS = 250; // must see 'g' at least this often
+// unsigned long g_last_heartbeat_time = 0;
+
+// const float RAMP_RATE = 1.5; // turns/sec^2 - tune to taste, lower = smoother
+
+// float g_current_right = 0.0;
+// float g_current_left  = 0.0;
+
+// float rampTowards(float target, float current) {
+//     float max_step = RAMP_RATE * (CMD_INTERVAL_MS / 1000.0);
+//     float delta = target - current;
+//     return current + constrain(delta, -max_step, max_step);
+// }
+
+// void setODriveVelocityMode() {
+//     ODRIVE_SERIAL.println("w axis0.controller.config.control_mode 2");
+//     ODRIVE_SERIAL.println("w axis1.controller.config.control_mode 2");
+//     ODRIVE_SERIAL.println("w axis0.controller.config.input_mode 1");
+//     ODRIVE_SERIAL.println("w axis1.controller.config.input_mode 1");
+// }
+
+// void printStatus() {
+//     Serial.println("---");
+//     Serial.println("Base Vel: " + String(BASE_VEL, 3));
+//     Serial.println("TRIM_RIGHT: " + String(TRIM_RIGHT, 3));
+//     Serial.println("TRIM_LEFT:  " + String(TRIM_LEFT, 3));
+//     Serial.println("---");
+// }
+
+// void handleSerial() {
+//     while (Serial.available()) {
+//         char c = Serial.read();
+//         switch (c) {
+//             case 'g':
+//                 g_last_heartbeat_time = millis(); // heartbeat received - keep running
+//                 break;
+//             case '+': TRIM_RIGHT += 0.01; printStatus(); break;
+//             case '-': TRIM_RIGHT -= 0.01; printStatus(); break;
+//             case '[': TRIM_LEFT  -= 0.01; printStatus(); break;
+//             case ']': TRIM_LEFT  += 0.01; printStatus(); break;
+//             case 'p': printStatus(); break;
+//             case 'v': {
+//                 String val = Serial.readStringUntil('\n');
+//                 BASE_VEL = val.toFloat();
+//                 Serial.println("Base Vel set to " + String(BASE_VEL, 3));
+//                 break;
+//             }
+//         }
+//     }
+// }
+
+// void setup() {
+//     Serial.begin(115200);
+//     ODRIVE_SERIAL.begin(ODRIVE_BAUD_RATE, SERIAL_8N1, ODRIVE_RX_PIN, ODRIVE_TX_PIN);
+//     delay(500);
+//     setODriveVelocityMode();
+//     Serial.println("Trim Test Ready. HOLD 'g' to run. Release/unplug to stop.");
+//     Serial.println("'+/-'=right trim  '[/]'=left trim  'p'=print  'vX.X'=set speed");
+//     printStatus();
+// }
+
+// void loop() {
+//     handleSerial();
+
+//     if (millis() - g_last_cmd_time < CMD_INTERVAL_MS) return;
+//     g_last_cmd_time = millis();
+
+//     bool alive = (millis() - g_last_heartbeat_time) < HEARTBEAT_TIMEOUT_MS;
+
+//     if (alive) {
+//         float right_cmd = BASE_VEL * TRIM_RIGHT * DIR_RIGHT;
+//         float left_cmd  = BASE_VEL * TRIM_LEFT * DIR_LEFT;
+//         g_current_right = rampTowards(right_cmd, g_current_right);
+//         g_current_left = rampTowards(left_cmd, g_current_left);
+//         ODRIVE_SERIAL.println("w axis0.controller.input_vel " + String(g_current_right, 3));
+//         ODRIVE_SERIAL.println("w axis1.controller.input_vel " + String(g_current_left, 3));
+//     } else {
+//         ODRIVE_SERIAL.println("w axis0.controller.input_vel 0");
+//         ODRIVE_SERIAL.println("w axis1.controller.input_vel 0");
+//     }
+// }

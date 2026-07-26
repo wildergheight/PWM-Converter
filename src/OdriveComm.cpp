@@ -1,6 +1,12 @@
 #include "OdriveComm.h"
 #include "Config.h"
 
+// --- Wheel Trim Calibration ---
+// Multiplicative correction for mechanical asymmetry (wheel diameter, motor Kv, etc.)
+// >1.0 = wheel runs faster/harder relative to its pair, <1.0 = weaker
+const float TRIM_RIGHT = 1.00;  // start here, adjust during calibration
+const float TRIM_LEFT  = 1.00;
+
 void checkODriveStatus() {
 #if TUNING_MODE
     return; // odrivetool / Python scripts have exclusive access to the serial line.
@@ -120,8 +126,8 @@ void sendOdriveVelocity(float right_vel, float left_vel) {
     (void)right_vel; (void)left_vel;
     return;
 #else
-    ODRIVE_SERIAL.println("w axis0.controller.input_vel " + String(right_vel, 2));
-    ODRIVE_SERIAL.println("w axis1.controller.input_vel " + String(left_vel, 2));
+    ODRIVE_SERIAL.println("w axis0.controller.input_vel " + String(right_vel * TRIM_RIGHT, 2));
+    ODRIVE_SERIAL.println("w axis1.controller.input_vel " + String(left_vel * TRIM_LEFT, 2));
 #endif
 }
 
@@ -130,7 +136,7 @@ void sendOdriveTorque(float right_torque, float left_torque) {
     (void)right_torque; (void)left_torque;
     return;
 #else
-    ODRIVE_SERIAL.print("c 0 " + String(right_torque, 2) + "\n");
-    ODRIVE_SERIAL.print("c 1 " + String(left_torque, 2) + "\n");
+    ODRIVE_SERIAL.print("c 0 " + String(right_torque * TRIM_RIGHT, 2) + "\n");
+    ODRIVE_SERIAL.print("c 1 " + String(left_torque * TRIM_LEFT, 2) + "\n");
 #endif
 }
