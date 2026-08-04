@@ -21,6 +21,19 @@ typedef struct __attribute__((packed)) UWBData {
     bool  bearing_valid; // false → single-anchor mode, distance only
 } UWBData;
 
+// Status alert broadcast to the tag (packed, sizeof = 8 - distinct from UWBData/ControlData)
+typedef struct __attribute__((packed)) StatusAlert {
+    uint8_t control_state;
+    bool    distance_fault;
+    bool    bearing_fault;
+    bool    lvc_active;
+    float   bus_voltage;
+} StatusAlert;
+
+extern bool          g_distance_fault;
+extern bool          g_bearing_fault;
+extern unsigned long g_last_status_broadcast_time;
+
 extern ControlState g_control_state;
 
 extern ControlData              espnowData;

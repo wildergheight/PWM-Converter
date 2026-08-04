@@ -2,18 +2,39 @@
 #include "Config.h"
 #include "OdriveComm.h"
 #include "DistanceController.h"
+#include "BearingController.h"
 
-// kp lowered from 3.0 to 2.0 to reduce overshoot/rubber-banding.
-// At kp=3.0 a 0.5m error commanded 1.5 RPS which was enough to overshoot
-// the setpoint, triggering the no-reverse clamp repeatedly. At kp=2.0 the
-// same error gives 1.0 RPS - smoother approach, less oscillation.
-// Raise kp again if the cart feels too sluggish to catch up.
+static unsigned long g_distance_fault_start = 0;
+static unsigned long g_bearing_fault_start  = 0;
+
+// --- DistanceController ---
 static DistanceController distController = []() {
     DistanceControllerConfig cfg;
-    cfg.kp = 2.0f; // only override what differs from defaults
+    cfg.kp = 2.0f; // reduced from 3.0 to reduce overshoot
     return DistanceController(cfg);
 }();
-static bool distControllerReady = false;
+
+// --- BearingController ---
+static BearingController bearingController = []() {
+    BearingControllerConfig cfg;
+    cfg.kp              = BEARING_KP;
+    cfg.ki              = BEARING_KI;
+    cfg.deadband_rad    = BEARING_DEADBAND_RAD;
+    cfg.integral_clamp  = BEARING_INTEGRAL_CLAMP;
+    cfg.max_omega       = BEARING_MAX_OMEGA;
+    return BearingController(cfg);
+}();
+
+// --- Bearing low-pass filter state ---
+static float  g_bearing_filtered  = 0.0f;
+static bool   g_bearing_lpf_ready = false; // false until first valid bearing seen
+
+static bool distControllerReady   = false;
+static bool bearingControllerReady = false;
+
+//================================================================================
+// Helpers
+//================================================================================
 
 float applyAsymmetricRamp(float target, float current) {
     float delta = target - current;
@@ -22,6 +43,10 @@ float applyAsymmetricRamp(float target, float current) {
         : VEL_DECEL_LIMIT * (COMMAND_INTERVAL_MS / 1000.0f);
     return current + constrain(delta, -max_change, max_change);
 }
+
+//================================================================================
+// State machine
+//================================================================================
 
 ControlState determineDesiredState() {
     bool espnow_failsafe = (millis() - g_last_espnow_command_time > ESPNOW_FAILSAFE_TIMEOUT_MS);
@@ -37,7 +62,6 @@ ControlState determineDesiredState() {
             AUTO_SERIAL.println("AUTO: UWB stale - braking");
             return STATE_BRAKING;
         }
-        // Also brake if Anchor B explicitly marked data invalid
         if (espnowData.auto_mode && !g_uwb_data.valid) {
             AUTO_SERIAL.println("AUTO: UWB invalid - braking");
             return STATE_BRAKING;
@@ -53,9 +77,16 @@ void handleStateTransition(ControlState desired_state) {
 
     if (g_control_state == STATE_VELOCITY_AUTO && desired_state != STATE_VELOCITY_AUTO) {
         distController.reset();
-        distControllerReady = false;
-        g_current_vel_left  = 0.0f;
-        g_current_vel_right = 0.0f;
+        bearingController.reset();
+        distControllerReady    = false;
+        bearingControllerReady = false;
+        g_bearing_lpf_ready    = false;
+        g_current_vel_left     = 0.0f;
+        g_current_vel_right    = 0.0f;
+        g_distance_fault        = false;   // add
+        g_bearing_fault         = false;   // add
+        g_distance_fault_start  = 0;       // add
+        g_bearing_fault_start   = 0;       // add
     }
 
 #if !TUNING_MODE
@@ -70,6 +101,10 @@ void handleStateTransition(ControlState desired_state) {
     delay(5);
 #endif
 }
+
+//================================================================================
+// Execute
+//================================================================================
 
 void executeControlState() {
     switch (g_control_state) {
@@ -91,12 +126,17 @@ void executeControlState() {
             break;
 
         case STATE_VELOCITY_AUTO: {
+            // --- Init on first entry ---
             if (!distControllerReady) {
                 distController.reset();
                 distControllerReady = true;
             }
+            if (!bearingControllerReady) {
+                bearingController.reset();
+                bearingControllerReady = true;
+            }
 
-            // USB serial override (bench testing)
+            // --- USB serial override (bench testing) ---
             if (millis() - g_last_auto_command_time < AUTO_FAILSAFE_TIMEOUT_MS) {
                 float right_vel = g_auto_right_norm * MAX_VELOCITY_RPS;
                 float left_vel  = g_auto_left_norm  * MAX_VELOCITY_RPS;
@@ -110,43 +150,98 @@ void executeControlState() {
                 break;
             }
 
-            // --- UWB distance control ---
+            // --- Distance PID → v_forward ---
             float dist    = g_uwb_data.distance_m;
-            float bearing = g_uwb_data.bearing_rad;
-
             float v_forward = distController.update(dist);
 
-            // No reverse in auto mode: if too close, stop and let the
-            // integrator decay rather than accumulating negative windup.
-            // The DistanceController's deadband decay handles this when
-            // we're near setpoint; when we're clearly over it (v_forward
-            // meaningfully negative), nudge the integrator toward zero
-            // faster so recovery isn't sluggish when the operator moves away.
+            // No-reverse clamp with integrator reset to prevent windup
             if (v_forward < 0.0f) {
-                distController.reset(); // clear windup when pinned to floor
+                distController.reset();
                 v_forward = 0.0f;
             }
 
-            g_current_vel_right = applyAsymmetricRamp(v_forward, g_current_vel_right);
-            g_current_vel_left  = applyAsymmetricRamp(v_forward, g_current_vel_left);
+            // --- Bearing low-pass filter ---
+            // Only run when bearing data is valid (2-anchor trilateration OK).
+            // On first valid reading after a gap, seed the filter with the
+            // current value so it doesn't ramp in from a stale state.
+            float bearing_raw = g_uwb_data.bearing_rad;
+            if (g_uwb_data.bearing_valid) {
+                if (!g_bearing_lpf_ready) {
+                    g_bearing_filtered = bearing_raw; // seed on first valid reading
+                    g_bearing_lpf_ready = true;
+                } else {
+                    g_bearing_filtered = BEARING_LPF_ALPHA * bearing_raw
+                                       + (1.0f - BEARING_LPF_ALPHA) * g_bearing_filtered;
+                }
+            } else {
+                // Single-anchor mode: no reliable bearing, decay filter toward 0
+                // so there's no stale steering bias if bearing becomes valid again.
+                g_bearing_filtered *= 0.9f;
+                g_bearing_lpf_ready = false;
+            }
 
+            // --- Bearing PID → omega ---
+            // Authority scales with current forward speed so the cart can't
+            // spin or flip from a large differential at low speed.
+            // Uses the average of ramped wheel velocities (what the cart is
+            // actually doing, not the target v_forward) for honest authority.
+            float current_speed = (g_current_vel_right + g_current_vel_left) / 2.0f;
+            float authority = constrain(current_speed / STEER_FULL_AUTHORITY_VEL, 0.0f, 1.0f);
+
+            float omega = 0.0f;
+            if (g_uwb_data.bearing_valid) {
+                omega = bearingController.update(g_bearing_filtered, authority);
+            } else {
+                bearingController.reset(); // don't let integral wind up in single-anchor mode
+            }
+
+            // --- Fault persistence tracking (for tag vibration alert) ---
+            bool dist_out_of_band = (distController.getLastError() != 0.0f);
+            if (dist_out_of_band) {
+                if (g_distance_fault_start == 0) g_distance_fault_start = millis();
+                g_distance_fault = (millis() - g_distance_fault_start) > FAULT_PERSIST_MS;
+            } else {
+                g_distance_fault_start = 0;
+                g_distance_fault = false;
+            }
+
+            bool bearing_out_of_band = g_uwb_data.bearing_valid && (bearingController.getLastError() != 0.0f);
+            if (bearing_out_of_band) {
+                if (g_bearing_fault_start == 0) g_bearing_fault_start = millis();
+                g_bearing_fault = (millis() - g_bearing_fault_start) > FAULT_PERSIST_MS;
+            } else {
+                g_bearing_fault_start = 0;
+                g_bearing_fault = false;
+            }
+
+            // Scale omega by authority so the physical differential matches
+            // what the plant can actually execute at this speed
+            float omega_scaled = omega * authority * STEER_DIR;
+
+            // --- Mixing: v_forward ± differential ---
+            // bearing > 0 (tag right of centre) → omega > 0 → left faster → turns right
+            // Both clamped to [0, MAX] - no reverse on either wheel in auto mode.
+            float v_left  = constrain(v_forward + omega_scaled * STEER_MIX_SCALE,
+                                      0.0f, MAX_VELOCITY_RPS);
+            float v_right = constrain(v_forward - omega_scaled * STEER_MIX_SCALE,
+                                      0.0f, MAX_VELOCITY_RPS);
+
+            g_current_vel_right = applyAsymmetricRamp(v_right, g_current_vel_right);
+            g_current_vel_left  = applyAsymmetricRamp(v_left,  g_current_vel_left);
+
+            // --- Output ---
 #if AUTO_DRY_RUN
-            AUTO_SERIAL.print("DRY_RUN | dist=");
-            AUTO_SERIAL.print(dist, 3);
+            AUTO_SERIAL.print("DRY | dist=");   AUTO_SERIAL.print(dist, 2);
             AUTO_SERIAL.print("m | brg=");
-            AUTO_SERIAL.print(bearing * 180.0f / PI, 1);
-            AUTO_SERIAL.print("deg");
-            if (!g_uwb_data.bearing_valid) AUTO_SERIAL.print("(single-anchor)");
-            AUTO_SERIAL.print(" | v_fwd=");
-            AUTO_SERIAL.print(v_forward, 3);
-            AUTO_SERIAL.print(" | v_r=");
-            AUTO_SERIAL.print(-g_current_vel_right, 3);
-            AUTO_SERIAL.print(" | v_l=");
-            AUTO_SERIAL.print(g_current_vel_left, 3);
-            AUTO_SERIAL.print(" | err=");
-            AUTO_SERIAL.print(distController.getLastError(), 3);
-            AUTO_SERIAL.print(" | intg=");
-            AUTO_SERIAL.println(distController.getIntegral(), 3);
+            AUTO_SERIAL.print(g_bearing_filtered * 180.0f / PI, 1);
+            if (!g_uwb_data.bearing_valid) AUTO_SERIAL.print("(1A)"); // 1-anchor mode
+            AUTO_SERIAL.print("deg | auth=");   AUTO_SERIAL.print(authority, 2);
+            AUTO_SERIAL.print(" | vfwd=");      AUTO_SERIAL.print(v_forward, 2);
+            AUTO_SERIAL.print(" | omega=");     AUTO_SERIAL.print(omega_scaled, 3);
+            AUTO_SERIAL.print(" | vR=");        AUTO_SERIAL.print(-g_current_vel_right, 2);
+            AUTO_SERIAL.print(" | vL=");        AUTO_SERIAL.print(g_current_vel_left, 2);
+            AUTO_SERIAL.print(" | dErr=");      AUTO_SERIAL.print(distController.getLastError(), 2);
+            AUTO_SERIAL.print(" | bErr=");      AUTO_SERIAL.println(bearingController.getLastError() * 180.0f / PI, 1);
 #else
     #if !TUNING_MODE
             sendOdriveVelocity(-g_current_vel_right, g_current_vel_left);

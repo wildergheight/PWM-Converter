@@ -14,4 +14,8 @@ void initEspNow();
 
 // If we haven't heard from the remote in SCAN_START_DELAY_MS, hop to the next
 // WiFi channel every SCAN_INTERVAL_MS to hunt for the remote's channel.
-void handleChannelScanning();
+// void handleChannelScanning();
+
+// Broadcasts current cart status (control state + faults + voltage) to the
+// tag so the golfer can feel it via vibration motor without turning around.
+void sendStatusAlert();

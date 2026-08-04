@@ -54,10 +54,15 @@ void setup() {
 }
 
 void loop() {
-    handleChannelScanning(); // Start hunting if the remote is gone
+    // handleChannelScanning(); // Start hunting if the remote is gone
     checkAutoSerial();
     checkODriveStatus();     // Ask for and parse ODrive status (no-op if TUNING_MODE)
 
+    if (millis() - g_last_status_broadcast_time > STATUS_BROADCAST_INTERVAL_MS) {
+        g_last_status_broadcast_time = millis();
+        sendStatusAlert();
+    }
+    
     if (millis() - g_last_command_time < COMMAND_INTERVAL_MS) return;
     g_last_command_time = millis();
 

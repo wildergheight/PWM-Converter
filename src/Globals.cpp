@@ -32,3 +32,7 @@ bool g_lvc_activated = false;
 int g_lvc_consecutive_count = 0;
 
 unsigned long g_last_command_time = 0;
+
+bool          g_distance_fault = false;
+bool          g_bearing_fault  = false;
+unsigned long g_last_status_broadcast_time = 0;
