@@ -10,6 +10,14 @@ unsigned long g_last_scan_time = 0;
 UWBData g_uwb_data = {0.0f, 0.0f, false};
 volatile unsigned long g_last_uwb_data_time = 0;
 
+volatile bool          g_uwb_eval_pending       = false;
+volatile unsigned long g_uwb_eval_t_ms          = 0;
+volatile unsigned long g_uwb_eval_gap_ms        = 0;
+volatile float         g_uwb_eval_distance_m    = 0.0f;
+volatile float         g_uwb_eval_bearing_rad   = 0.0f;
+volatile bool          g_uwb_eval_valid         = false;
+volatile bool          g_uwb_eval_bearing_valid = false;
+
 String g_auto_serial_buffer = "";
 float g_auto_right_norm = 0.0;
 float g_auto_left_norm = 0.0;

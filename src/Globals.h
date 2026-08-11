@@ -44,6 +44,18 @@ extern unsigned long            g_last_scan_time;
 extern UWBData                  g_uwb_data;
 extern volatile unsigned long   g_last_uwb_data_time;
 
+// --- UWB Eval Logging ---
+// Filled inside the ESP-NOW recv callback (onDataRecv), printed from
+// checkUwbEvalLog() in the main loop -- keeps Serial I/O out of the
+// ESP-NOW callback context. No-op overhead if UWB_EVAL_LOG is false.
+extern volatile bool          g_uwb_eval_pending;
+extern volatile unsigned long g_uwb_eval_t_ms;
+extern volatile unsigned long g_uwb_eval_gap_ms;
+extern volatile float         g_uwb_eval_distance_m;
+extern volatile float         g_uwb_eval_bearing_rad;
+extern volatile bool          g_uwb_eval_valid;
+extern volatile bool          g_uwb_eval_bearing_valid;
+
 extern String         g_auto_serial_buffer;
 extern float          g_auto_right_norm;
 extern float          g_auto_left_norm;

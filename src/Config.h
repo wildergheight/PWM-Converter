@@ -5,9 +5,20 @@
 // --- Tuning Mode ---
 #define TUNING_MODE false
 
+// --- UWB Reliability Eval ---
+// Logs every incoming UWB packet the instant it arrives over ESP-NOW (NOT
+// gated to the 20ms control loop), so packet rate, dropout gaps, and per-
+// reading noise can be measured independent of drive state. Doesn't require
+// STATE_VELOCITY_AUTO -- just power the cart and wear the tag.
+#define UWB_EVAL_LOG true
+
+// --- Raw UWB CSV Log ---
+// Emits one CSV row per control cycle with the raw, unfiltered UWB input
+// -- for feeding replay_harness.py. Independent of AUTO_DRY_RUN so you can
+// run both at once (dry run for eyeballing live, CSV for later replay).
+#define RAW_UWB_CSV_LOG false
+
 // --- Auto Dry Run ---
-// true  = logs computed commands over serial, does NOT send to ODrive.
-// false = live operation.
 #define AUTO_DRY_RUN false
 
 // --- ODrive Serial ---
@@ -32,7 +43,7 @@ constexpr unsigned long QUERY_INTERVAL_MS = 100;
 constexpr float MAX_TORQUE           = 30.0f;
 constexpr float STEERING_SENSITIVITY = 0.5f;
 constexpr float THROTTLE_EXPO        = 2.3f;
-constexpr float TORQUE_RAMP_RATE     = 2.0f; // Nm/s
+constexpr float TORQUE_RAMP_RATE     = 2.0f;
 
 // --- Velocity Control ---
 constexpr float MAX_VELOCITY_RPS = 3.0f;
@@ -41,35 +52,41 @@ constexpr float VEL_DECEL_LIMIT  = 10.0f;
 
 // --- Bearing / Steering ---
 
-// Flip to 1.0f if steering direction is reversed (depends on which side
-// Anchor B is mounted relative to the cart's forward direction).
+// Flip to 1.0f if steering direction reverses
 constexpr float STEER_DIR = -1.0f;
 
-// Converts omega (rad/s) → differential wheel velocity (RPS).
-// This is the most impactful steering tuning knob - adjust before kp.
-// On a maintained golf fairway start here and come down if it overcorrects.
+// Differential wheel speed per unit of omega (rad/s → RPS).
+// Adjust this before changing kp - it's the cleanest authority knob.
 constexpr float STEER_MIX_SCALE = 3.0f;
 
-// Speed at which full steering authority is granted (RPS).
-// Below this, omega scales linearly to zero.
+// Forward speed at which full steering authority is granted (RPS).
 constexpr float STEER_FULL_AUTHORITY_VEL = 0.3f;
 
-// BearingController PID gains.
-// kp: (rad/s) per radian of bearing error. Raise if turns feel sluggish,
-//     lower first if you see steering oscillation.
-// ki: very small - bearing is noisy. Raise only after kp is settled.
-// deadband_rad: errors smaller than this produce no steering output.
-//     Should sit comfortably above your noise floor (±8° = 0.140 rad).
-constexpr float BEARING_KP           = 3.0f;
-constexpr float BEARING_KI           = 0.05f;
-constexpr float BEARING_DEADBAND_RAD = 0.140f; // ±8°
-constexpr float BEARING_INTEGRAL_CLAMP = 0.3f;
-constexpr float BEARING_MAX_OMEGA    = 0.8f;   // raised from 0.5 to allow snappier turns
+// Max change in omega per 20ms cycle. Prevents snap-turning when static
+// friction breaks. Lower = smoother initiation; raise if turns feel sluggish.
+constexpr float OMEGA_RAMP_RATE = 0.04f;
 
-// Bearing low-pass filter coefficient [0,1].
-// Lower = heavier filtering, more lag. Higher = more responsive, more noise.
-// Raise toward 0.4 if turns feel delayed; lower toward 0.1 if bearing is jumpy.
-constexpr float BEARING_LPF_ALPHA = 0.2f;
+constexpr float MIN_WHEEL_VEL = 0.15f; // never let an active wheel go below this
+
+// --- BearingController gains ---
+// kp:  proportional - raise if slow to react, lower if oscillates
+// ki:  integral - keep small, bearing is noisy
+// kd:  derivative - key for "turn earlier + dampen overshoot"
+//      raise if still slow to initiate, lower if D-term causes jitter
+constexpr float BEARING_KP              = 2.0f;
+constexpr float BEARING_KI              = 0.05f;
+constexpr float BEARING_KD              = 0.3f;
+constexpr float BEARING_KD_FILTER_ALPHA = 0.4f;  // smooths derivative term
+constexpr float BEARING_DEADBAND_RAD    = 0.140f; // ±8°
+constexpr float BEARING_INTEGRAL_CLAMP  = 0.3f;
+constexpr float BEARING_MAX_OMEGA       = 0.8f;
+
+// Bearing input low-pass filter [0,1].
+// Raised from 0.1 to 0.3 - the heavy 0.1 filter caused too much lag,
+// delaying bearing response by ~0.6s. At 0.3 response is ~0.2s which
+// is much better for walking-speed tracking. The derivative term now
+// compensates for the noisier but faster signal.
+constexpr float BEARING_LPF_ALPHA = 0.3f;
 
 // --- Battery & LVC ---
 constexpr bool  ENABLE_LOW_VOLTAGE_CUTOFF = true;
@@ -81,10 +98,9 @@ constexpr unsigned long COMMAND_INTERVAL_MS        = 20;
 constexpr unsigned long ESPNOW_FAILSAFE_TIMEOUT_MS = 500;
 constexpr unsigned long AUTO_FAILSAFE_TIMEOUT_MS   = 500;
 constexpr unsigned long UWB_FAILSAFE_TIMEOUT_MS    = 1000;
-
-// --- Status Alert (to tag) ---
+// --- Status Broadcast (to tag, via ESP-NOW) ---
 constexpr unsigned long STATUS_BROADCAST_INTERVAL_MS = 120;
-constexpr unsigned long FAULT_PERSIST_MS              = 1000; // error must persist this long before alerting
+constexpr unsigned long FAULT_PERSIST_MS = 120;
 
 // --- ESP-NOW Channel Scanning ---
 constexpr unsigned long SCAN_INTERVAL_MS    = 150;

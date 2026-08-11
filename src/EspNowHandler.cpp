@@ -7,13 +7,30 @@
 
 static uint8_t g_broadcast_addr[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
 
+#if UWB_EVAL_LOG
+static unsigned long g_eval_last_pkt_time = 0; // for inter-packet gap, eval-log scope only
+#endif
+
 static void onDataRecv(const uint8_t *mac, const uint8_t *incomingData, int len) {
     // Route by packet size:
     //   sizeof(UWBData)     = 10  → Anchor B  (packed struct)
     //   sizeof(ControlData) = 12  → T-Beam remote
     if (len == sizeof(UWBData)) {
         memcpy(&g_uwb_data, incomingData, sizeof(UWBData));
-        g_last_uwb_data_time = millis();
+        unsigned long now = millis();
+        g_last_uwb_data_time = now;
+
+        #if UWB_EVAL_LOG
+            g_uwb_eval_gap_ms        = (g_eval_last_pkt_time == 0) ? 0 : (now - g_eval_last_pkt_time);
+            g_eval_last_pkt_time     = now;
+            g_uwb_eval_t_ms          = now;
+            g_uwb_eval_distance_m    = g_uwb_data.distance_m;
+            g_uwb_eval_bearing_rad   = g_uwb_data.bearing_rad;
+            g_uwb_eval_valid         = g_uwb_data.valid;
+            g_uwb_eval_bearing_valid = g_uwb_data.bearing_valid;
+            g_uwb_eval_pending       = true;
+        #endif   
+
     } else if (len == sizeof(ControlData)) {
         memcpy(&espnowData, incomingData, sizeof(espnowData));
         g_last_espnow_command_time = millis();
@@ -68,4 +85,20 @@ void sendStatusAlert() {
     status.bus_voltage    = g_bus_voltage;
 
     esp_now_send(g_broadcast_addr, (uint8_t *)&status, sizeof(status));
+}
+
+void checkUwbEvalLog() {
+#if UWB_EVAL_LOG
+    if (!g_uwb_eval_pending) return;
+    g_uwb_eval_pending = false;
+
+    // UWBLOG,<t_ms>,<gap_ms>,<distance_m>,<bearing_rad>,<valid>,<bearing_valid>
+    AUTO_SERIAL.print("UWBLOG,");
+    AUTO_SERIAL.print(g_uwb_eval_t_ms);           AUTO_SERIAL.print(",");
+    AUTO_SERIAL.print(g_uwb_eval_gap_ms);         AUTO_SERIAL.print(",");
+    AUTO_SERIAL.print(g_uwb_eval_distance_m, 4);  AUTO_SERIAL.print(",");
+    AUTO_SERIAL.print(g_uwb_eval_bearing_rad, 5); AUTO_SERIAL.print(",");
+    AUTO_SERIAL.print(g_uwb_eval_valid ? 1 : 0);  AUTO_SERIAL.print(",");
+    AUTO_SERIAL.println(g_uwb_eval_bearing_valid ? 1 : 0);
+#endif
 }

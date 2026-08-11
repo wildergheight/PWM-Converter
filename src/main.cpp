@@ -57,6 +57,7 @@ void loop() {
     // handleChannelScanning(); // Start hunting if the remote is gone
     checkAutoSerial();
     checkODriveStatus();     // Ask for and parse ODrive status (no-op if TUNING_MODE)
+    checkUwbEvalLog();       // Print any pending UWBLOG line (no-op if UWB_EVAL_LOG false)
 
     if (millis() - g_last_status_broadcast_time > STATUS_BROADCAST_INTERVAL_MS) {
         g_last_status_broadcast_time = millis();

@@ -19,3 +19,9 @@ void initEspNow();
 // Broadcasts current cart status (control state + faults + voltage) to the
 // tag so the golfer can feel it via vibration motor without turning around.
 void sendStatusAlert();
+
+// Prints one UWBLOG CSV line to AUTO_SERIAL if a new UWB packet arrived
+// since the last call. Call every loop() iteration. No-op if UWB_EVAL_LOG
+// is false or no new packet is pending. Keeps Serial I/O out of the
+// ESP-NOW recv callback itself.
+void checkUwbEvalLog();
