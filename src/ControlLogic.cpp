@@ -30,6 +30,9 @@ static bool  g_bearing_lpf_ready  = false;
 static float g_omega_prev         = 0.0f; // for omega ramp
 static bool  distControllerReady  = false;
 static bool  bearingControllerReady = false;
+// NEW: for freshness-gated bearing updates
+static float         g_omega_raw            = 0.0f; // last PID output, held between real UWB updates
+static unsigned long g_last_bearing_update_ms = 0;   // for computing real dt between updates
 
 //================================================================================
 // Helpers
@@ -84,6 +87,18 @@ void handleStateTransition(ControlState desired_state) {
         g_omega_prev           = 0.0f;
         g_current_vel_left     = 0.0f;
         g_current_vel_right    = 0.0f;
+        // NEW:
+        g_omega_raw              = 0.0f;
+        g_last_bearing_update_ms = 0;
+        g_uwb_data_fresh         = false;
+    }
+
+    // NEW: entering torque mode from anywhere else should start the torque
+    // ramp from a known-zero baseline, matching the "c 0 0"/"c 1 0" now sent
+    // in sendOdriveModeTransition, so software and hardware agree.
+    if (desired_state == STATE_TORQUE_ESPNOW && g_control_state != STATE_TORQUE_ESPNOW) {
+        g_last_sent_right_torque = 0.0f;
+        g_last_sent_left_torque  = 0.0f;
     }
 
 #if !TUNING_MODE
@@ -119,7 +134,7 @@ void executeControlState() {
 #if !TUNING_MODE
             sendOdriveBrake();
 #endif
-            AUTO_SERIAL.println("BRAKE");
+            // AUTO_SERIAL.println("BRAKE");
             break;
 
         case STATE_VELOCITY_AUTO: {
@@ -163,34 +178,48 @@ void executeControlState() {
                 AUTO_SERIAL.println(g_uwb_data.bearing_valid ? 1 : 0);
             #endif
 
-            // --- Bearing LPF ---
-            if (g_uwb_data.bearing_valid) {
-                float bearing_raw = g_uwb_data.bearing_rad;
-                if (!g_bearing_lpf_ready) {
-                    g_bearing_filtered = bearing_raw;
-                    g_bearing_lpf_ready = true;
-                } else {
-                    g_bearing_filtered = BEARING_LPF_ALPHA * bearing_raw
-                                       + (1.0f - BEARING_LPF_ALPHA) * g_bearing_filtered;
-                }
-            } else {
-                g_bearing_filtered *= 0.9f;
-                g_bearing_lpf_ready = false;
-            }
-
-            // --- Bearing PID → omega ---
+// --- Authority from current speed (computed every cycle, not gated) ---
             float current_speed = (g_current_vel_right + g_current_vel_left) / 2.0f;
             float authority = constrain(current_speed / STEER_FULL_AUTHORITY_VEL, 0.0f, 1.0f);
 
-            float omega = 0.0f;
-            if (g_uwb_data.bearing_valid) {
-                omega = bearingController.update(g_bearing_filtered, authority);
-            } else {
-                bearingController.reset();
-            }
+            // --- Bearing LPF + PID: only recompute when a NEW UWB packet has
+            // actually arrived. Previously this ran every 20ms tick even when
+            // g_uwb_data still held the same packet from 100-400ms ago, which
+            // both fed the LPF a repeated value and made the PID's derivative
+            // term assume a fixed 20ms dt that wasn't real. ---
+            if (g_uwb_data_fresh) {
+                g_uwb_data_fresh = false;
 
-            // Scale by authority and apply STEER_DIR
-            float omega_target = omega * authority * STEER_DIR;
+                unsigned long now_ms = millis();
+                float dt_s = (g_last_bearing_update_ms == 0)
+                    ? 0.02f
+                    : constrain((now_ms - g_last_bearing_update_ms) / 1000.0f, 0.01f, 1.0f);
+                g_last_bearing_update_ms = now_ms;
+
+                if (g_uwb_data.bearing_valid) {
+                    float bearing_raw = g_uwb_data.bearing_rad;
+                    if (!g_bearing_lpf_ready) {
+                        g_bearing_filtered = bearing_raw;
+                        g_bearing_lpf_ready = true;
+                    } else {
+                        g_bearing_filtered = BEARING_LPF_ALPHA * bearing_raw
+                                           + (1.0f - BEARING_LPF_ALPHA) * g_bearing_filtered;
+                    }
+                    g_omega_raw = bearingController.update(g_bearing_filtered, authority, dt_s);
+                } else {
+                    g_bearing_filtered *= 0.9f;
+                    g_bearing_lpf_ready = false;
+                    g_omega_raw = 0.0f;
+                    bearingController.reset();
+                }
+            }
+            // else: g_omega_raw holds whatever it was last real update -- the
+            // ramp below still runs every cycle, so the cart doesn't freeze,
+            // it just steers toward the last known-good target until fresh
+            // data arrives.
+
+            // Scale by CURRENT authority (every cycle) and apply STEER_DIR
+            float omega_target = g_omega_raw * authority * STEER_DIR;
 
             // --- Omega ramp: prevents snap-turning when stiction breaks ---
             // The cart may resist turning until friction is overcome, then
@@ -201,18 +230,45 @@ void executeControlState() {
                 + constrain(omega_delta, -OMEGA_RAMP_RATE, OMEGA_RAMP_RATE);
             g_omega_prev = omega_scaled;
 
-            // how much differential we can apply without either wheel dropping below the floor
-            float max_diff = fmaxf(v_forward - MIN_WHEEL_VEL, 0.0f);
+            // Floor only protects an ACTIVE turn from saturating a wheel to
+            // zero -- when omega_scaled is ~0 (going straight / holding
+            // position), there's no differential to protect, so the floor
+            // must be 0 too, or v_forward=0 gets forced up to MIN_WHEEL_VEL
+            // and the cart creeps with no steering command at all.
+            bool  is_turning  = fabsf(omega_scaled) > TURN_EPSILON;
+            float wheel_floor = is_turning ? MIN_WHEEL_VEL : 0.0f;
+
+            float max_diff = is_turning ? fmaxf(v_forward - wheel_floor, 0.0f) : 0.0f;
             float diff = constrain(omega_scaled * STEER_MIX_SCALE, -max_diff, max_diff);
 
             // --- Mix: v_forward ± differential, no reverse on either wheel ---
-            float v_left  = constrain(v_forward + diff, MIN_WHEEL_VEL, MAX_VELOCITY_RPS);
-            float v_right = constrain(v_forward - diff, MIN_WHEEL_VEL, MAX_VELOCITY_RPS);
+            float v_left  = constrain(v_forward + diff, wheel_floor, MAX_VELOCITY_RPS);
+            float v_right = constrain(v_forward - diff, wheel_floor, MAX_VELOCITY_RPS);
 
             g_current_vel_right = applyAsymmetricRamp(v_right, g_current_vel_right);
             g_current_vel_left  = applyAsymmetricRamp(v_left,  g_current_vel_left);
 
             // --- Output ---
+
+// ControlLogic.cpp — add just before the existing AUTO_DRY_RUN block,
+// inside STATE_VELOCITY_AUTO, after g_current_vel_right/left are computed
+#if FULL_STATE_CSV_LOG
+            AUTO_SERIAL.print("FSLOG,");
+            AUTO_SERIAL.print(millis());                          AUTO_SERIAL.print(",");
+            AUTO_SERIAL.print(dist, 4);                            AUTO_SERIAL.print(",");
+            AUTO_SERIAL.print(g_uwb_data.bearing_rad, 5);          AUTO_SERIAL.print(",");
+            AUTO_SERIAL.print(g_bearing_filtered, 5);              AUTO_SERIAL.print(",");
+            AUTO_SERIAL.print(bearingController.getLastError(), 5);AUTO_SERIAL.print(",");
+            AUTO_SERIAL.print(bearingController.getIntegral(), 5); AUTO_SERIAL.print(",");
+            AUTO_SERIAL.print(bearingController.getLastDerivative(), 5); AUTO_SERIAL.print(",");
+            AUTO_SERIAL.print(g_omega_raw, 5);                     AUTO_SERIAL.print(",");
+            AUTO_SERIAL.print(omega_scaled, 5);                    AUTO_SERIAL.print(",");
+            AUTO_SERIAL.print(authority, 3);                       AUTO_SERIAL.print(",");
+            AUTO_SERIAL.print(v_forward, 4);                       AUTO_SERIAL.print(",");
+            AUTO_SERIAL.print(-g_current_vel_right, 4);            AUTO_SERIAL.print(",");
+            AUTO_SERIAL.println(g_current_vel_left, 4);
+#endif
+
 #if AUTO_DRY_RUN
             AUTO_SERIAL.print("DRY | dist=");   AUTO_SERIAL.print(dist, 2);
             AUTO_SERIAL.print("m | brg=");

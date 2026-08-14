@@ -16,6 +16,7 @@ static void onDataRecv(const uint8_t *mac, const uint8_t *incomingData, int len)
     //   sizeof(UWBData)     = 10  → Anchor B  (packed struct)
     //   sizeof(ControlData) = 12  → T-Beam remote
     if (len == sizeof(UWBData)) {
+        g_uwb_data_fresh = true;
         memcpy(&g_uwb_data, incomingData, sizeof(UWBData));
         unsigned long now = millis();
         g_last_uwb_data_time = now;

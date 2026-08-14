@@ -34,6 +34,8 @@ extern bool          g_distance_fault;
 extern bool          g_bearing_fault;
 extern unsigned long g_last_status_broadcast_time;
 
+extern volatile bool g_uwb_data_fresh; // true when a new UWB packet has arrived since last consumed
+
 extern ControlState g_control_state;
 
 extern ControlData              espnowData;

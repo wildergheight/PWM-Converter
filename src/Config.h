@@ -10,16 +10,20 @@
 // gated to the 20ms control loop), so packet rate, dropout gaps, and per-
 // reading noise can be measured independent of drive state. Doesn't require
 // STATE_VELOCITY_AUTO -- just power the cart and wear the tag.
-#define UWB_EVAL_LOG true
+#define UWB_EVAL_LOG false
 
 // --- Raw UWB CSV Log ---
 // Emits one CSV row per control cycle with the raw, unfiltered UWB input
 // -- for feeding replay_harness.py. Independent of AUTO_DRY_RUN so you can
 // run both at once (dry run for eyeballing live, CSV for later replay).
+
 #define RAW_UWB_CSV_LOG false
 
+// Config.h — new flag alongside RAW_UWB_CSV_LOG
+#define FULL_STATE_CSV_LOG true
+
 // --- Auto Dry Run ---
-#define AUTO_DRY_RUN false
+#define AUTO_DRY_RUN true
 
 // --- ODrive Serial ---
 #define ODRIVE_SERIAL Serial2
@@ -67,6 +71,7 @@ constexpr float STEER_FULL_AUTHORITY_VEL = 0.3f;
 constexpr float OMEGA_RAMP_RATE = 0.04f;
 
 constexpr float MIN_WHEEL_VEL = 0.15f; // never let an active wheel go below this
+constexpr float TURN_EPSILON    = 0.01f; // |omega_scaled| below this = "going straight", no floor applies
 
 // --- BearingController gains ---
 // kp:  proportional - raise if slow to react, lower if oscillates
@@ -109,3 +114,4 @@ constexpr unsigned long SCAN_START_DELAY_MS = 2000;
 // --- Derived ---
 constexpr float MAX_TORQUE_CHANGE_PER_CYCLE =
     TORQUE_RAMP_RATE * (COMMAND_INTERVAL_MS / 1000.0f);
+

@@ -47,7 +47,7 @@ void checkODriveStatus() {
                 float parsed_voltage = response.toFloat();
                 if (parsed_voltage > 10.0) {
                     g_bus_voltage = parsed_voltage;
-                    AUTO_SERIAL.println("VBUS: " + String(g_bus_voltage, 1) + "V");
+                    // AUTO_SERIAL.println("VBUS: " + String(g_bus_voltage, 1) + "V");
 
                     if (ENABLE_LOW_VOLTAGE_CUTOFF && g_bus_voltage < LOW_VOLTAGE_CUTOFF) {
                         g_lvc_consecutive_count++;
@@ -108,6 +108,15 @@ void sendOdriveModeTransition(ControlState from_state, ControlState to_state) {
         // Input mode: PASSTHROUGH
         ODRIVE_SERIAL.println("w axis0.controller.config.input_mode 1");
         ODRIVE_SERIAL.println("w axis1.controller.config.input_mode 1");
+
+        // NEW: input_torque isn't cleared by switching control_mode -- it
+        // still holds whatever was last sent before this axis LEFT torque
+        // mode (possibly mid-turn, from before auto mode was even engaged).
+        // Zero it explicitly so the motor doesn't act on stale torque the
+        // instant torque mode takes effect, before our first real command
+        // this cycle.
+        ODRIVE_SERIAL.println("c 0 0");
+        ODRIVE_SERIAL.println("c 1 0");
     }
 #endif
 }

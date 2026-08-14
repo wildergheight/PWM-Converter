@@ -10,7 +10,7 @@ void BearingController::reset() {
     first_update_    = true;
 }
 
-float BearingController::update(float bearing_rad, float authority) {
+float BearingController::update(float bearing_rad, float authority, float dt_s) {
     float error = bearing_rad;
     bool in_deadband = (fabsf(error) < cfg_.deadband_rad);
 
@@ -25,7 +25,7 @@ float BearingController::update(float bearing_rad, float authority) {
 
     // --- Integral (gated on authority to prevent windup while stationary) ---
     if (authority > 0.1f) {
-        integral_ += error * cfg_.loop_dt_s * authority;
+        integral_ += error * dt_s * authority;
         integral_  = constrain(integral_, -cfg_.integral_clamp, cfg_.integral_clamp);
     } else {
         integral_ *= 0.95f;
@@ -38,7 +38,7 @@ float BearingController::update(float bearing_rad, float authority) {
     // Skip on first update (no previous error to diff against).
     float d_term = 0.0f;
     if (!first_update_) {
-        float d_raw = (error - last_error_) / cfg_.loop_dt_s;
+        float d_raw = (error - last_error_) / dt_s;
 
         // Lightly filter the derivative itself to smooth residual noise
         last_d_filtered_ = cfg_.kd_filter_alpha * d_raw

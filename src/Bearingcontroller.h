@@ -33,7 +33,7 @@ public:
     BearingController(const BearingControllerConfig& cfg);
 
     // authority [0,1]: gates integrator and is used externally to scale omega output.
-    float update(float bearing_rad, float authority);
+    float update(float bearing_rad, float authority, float dt_s);
 
     void reset();
 

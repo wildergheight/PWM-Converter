@@ -7,6 +7,8 @@ volatile unsigned long g_last_espnow_command_time = 0;
 int g_current_channel = 1;
 unsigned long g_last_scan_time = 0;
 
+volatile bool g_uwb_data_fresh = false;
+
 UWBData g_uwb_data = {0.0f, 0.0f, false};
 volatile unsigned long g_last_uwb_data_time = 0;
 
